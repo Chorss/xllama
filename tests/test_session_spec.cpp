@@ -50,6 +50,34 @@ TEST_CASE("resolve_session_params: one resolver for every surface (ADR 0007)") {
     CHECK(resolve_session_params("x", g, "D:\\m\\x\\", 0).n_gpu_layers == 0);
 }
 
+TEST_CASE("resolve_session_params: operator thread knob for GGUF sessions (#457)") {
+    using xllama::kSessionThreadsKnobAbsent;
+    using xllama::resolve_session_threads;
+    // Absent, zero, negative or absurd: 0, which the loader turns into auto.
+    CHECK(resolve_session_threads(kSessionThreadsKnobAbsent) == 0);
+    CHECK(resolve_session_threads(0) == 0);
+    CHECK(resolve_session_threads(-3) == 0);
+    CHECK(resolve_session_threads(xllama::kMaxSessionThreadsKnob + 1) == 0);
+    CHECK(resolve_session_threads(1) == 1);
+    CHECK(resolve_session_threads(4) == 4);
+    CHECK(resolve_session_threads(xllama::kMaxSessionThreadsKnob) ==
+          xllama::kMaxSessionThreadsKnob);
+
+    CatalogueLoad g;
+    g.found = true;
+    g.gguf = true;
+    CHECK(resolve_session_params("m", g, "D:\\m", -1).n_threads == 0);
+    CHECK(resolve_session_params("m", g, "D:\\m", -1, 3).n_threads == 3);
+    // ORT entries and unknown models ignore it: ORT threads live in genai_config.
+    CatalogueLoad ort;
+    ort.found = true;
+    CHECK(resolve_session_params("o", ort, "D:\\m\\o", -1, 3).n_threads == 0);
+    CHECK(resolve_session_params("u", CatalogueLoad{}, "D:\\m\\u", -1, 3).n_threads == 0);
+    // Threads are a tuning knob, not the load identity.
+    CHECK(same_load(resolve_session_params("m", g, "D:\\m", -1),
+                    resolve_session_params("m", g, "D:\\m", -1, 3)));
+}
+
 TEST_CASE("same_load: an adapter, context or GPU split is a different model in RAM") {
     CatalogueLoad g;
     g.found = true;

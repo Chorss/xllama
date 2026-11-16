@@ -939,6 +939,14 @@ flags are supported:
   catalogue default (D3) applies unless the operator file
   `gguf_gpu_layers.txt` exists; `0` there forces the CPU. A change reloads the
   resident session.
+- **GGUF session threads** (#457): `CatalogueSessionParams` passes
+  `session_threads_knob()` to `resolve_session_params`, which applies
+  `resolve_session_threads`. `LocalState\session_threads.txt` holding 1..64
+  sets `n_threads` for the GUI and LAN API session; absent or anything else
+  keeps the auto count (`detect_threads_llama`). Threads are not part of
+  `same_load`, so a change applies at the next session load (app restart).
+  The session logs `n_threads=<n> (requested|auto)` after the load line. An
+  operator lever for measuring the App designation, not a tuned default.
 - **Manifest cache**: parsed once, cached; invalidated on personalized-model
   publish.
 - **Debug dashboard** (opt-in, default off): Settings toggle and/or

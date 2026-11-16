@@ -103,6 +103,18 @@ inline constexpr int resolve_gguf_gpu_layers(int catalogue_layers, int knob) {
     return catalogue_layers > 0 ? catalogue_layers : 0;
 }
 
+// CPU threads for an interactive GGUF session (GUI and LAN API, #457). The
+// operator knob LocalState\session_threads.txt, when it holds 1..64, sets
+// n_threads; anything else leaves 0, which the loader turns into
+// detect_threads_llama(). An operator lever for measuring a designation whose
+// cores the system shares (App on Series X), not a tuned default.
+inline constexpr int kSessionThreadsKnobAbsent = -1;
+inline constexpr int kMaxSessionThreadsKnob = 64;
+
+inline constexpr int resolve_session_threads(int knob) {
+    return knob >= 1 && knob <= kMaxSessionThreadsKnob ? knob : 0;
+}
+
 // Estimate ceiling for a session opened at |n_ctx|: the bound the CONTEXT puts on
 // a prompt, which is what has to stay coherent with token_threshold (#133). Not
 // the reply's budget — that is fit_prompt's, applied exactly and later, and it

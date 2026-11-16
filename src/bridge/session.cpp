@@ -1323,6 +1323,8 @@ std::unique_ptr<Session> create_llama(const SessionParams& sp, std::string* err)
     int n_threads = sp.n_threads > 0 ? sp.n_threads : detect_threads_llama();
     int n_ctx = sp.n_ctx > 0 ? sp.n_ctx : kDefaultNCtx;
     log_output("[xllama] Session: GGUF model loaded via llama.cpp (persistent)\n");
+    log_output("[xllama] Session: n_threads=" + std::to_string(n_threads) +
+               (sp.n_threads > 0 ? " (requested)\n" : " (auto)\n"));
     return std::make_unique<LlamaSession>(LlamaModelPtr(raw_model), std::move(adapter),
                                           sp.lora_scale, n_ctx, n_threads, sp.n_batch, sp.n_ubatch,
                                           sp.kv_q8, sp.prompt_lookup, gpu_layers);

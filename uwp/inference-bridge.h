@@ -57,6 +57,13 @@ void run_d3d12_selftest();
 // catalogue entry through resolve_gguf_gpu_layers (routing_policy.h, D3).
 int gguf_gpu_layers_knob();
 
+// Operator override for CPU threads in interactive GGUF sessions (GUI and LAN
+// API, #457): the value in LocalState\session_threads.txt, or
+// kSessionThreadsKnobAbsent when there is no file. resolve_session_threads
+// (routing_policy.h) maps it to SessionParams::n_threads. Threads are not part
+// of the load identity, so a change applies at the next session load.
+int session_threads_knob();
+
 // Heap-ceiling probe. Triggered by LocalFolder\ramceil.flag; writes
 // ramceil-result.csv (+ .done marker holding the stop reason) to LocalState.
 // Measures how much heap the process can actually commit under GameOS — the

@@ -7,6 +7,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- **Operator thread knob for interactive GGUF sessions (#457).**
+  `LocalState\session_threads.txt` (1..64) sets the llama.cpp thread count of
+  the GUI and LAN API session, which was fixed at the auto count; absent keeps
+  the auto count. The session now logs the count it loaded with. This lets the
+  App designation on a Series X, where the system clamps the app's CPU share
+  about ten seconds after launch, be measured at other thread counts. No
+  default changes.
+
 - **GPU correctness controls (ADR 0010, #420) and the four-column kernel
   (#313, #414).**
   - ADR 0010 was accepted, run once, found to fail an arm whose kernels are

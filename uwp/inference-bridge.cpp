@@ -163,6 +163,10 @@ void run_kv_bench(const std::string& model_name, const std::string& sys, const s
 int gguf_gpu_layers_knob() {
     return read_local_int("gguf_gpu_layers.txt", ::xllama::kGgufGpuLayersKnobAbsent);
 }
+
+int session_threads_knob() {
+    return read_local_int("session_threads.txt", ::xllama::kSessionThreadsKnobAbsent);
+}
 #endif // XLLAMA_UWP
 
 // ---------------------------------------------------------------------------

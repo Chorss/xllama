@@ -27,8 +27,11 @@ struct CatalogueLoad {
 // `model_dir` is where the model's files live (resolve_model_path on the bare
 // name); the adapter is resolved against it. `gpu_layers_knob` is the operator
 // override read by the caller (-1 = none, see resolve_gguf_gpu_layers).
+// `threads_knob` is the operator thread override (-1 = none, see
+// resolve_session_threads); it applies to GGUF entries only.
 inline SessionParams resolve_session_params(const std::string& model, const CatalogueLoad& c,
-                                            const std::string& model_dir, int gpu_layers_knob) {
+                                            const std::string& model_dir, int gpu_layers_knob,
+                                            int threads_knob = kSessionThreadsKnobAbsent) {
     SessionParams sp;
     sp.model_path = model;
     sp.n_ctx = kDefaultNCtx;
@@ -39,6 +42,7 @@ inline SessionParams resolve_session_params(const std::string& model, const Cata
         return sp;
     sp.backend = Backend::LlamaCpp;
     sp.n_gpu_layers = resolve_gguf_gpu_layers(c.gpu_layers, gpu_layers_knob);
+    sp.n_threads = resolve_session_threads(threads_knob);
     if (!c.lora.empty()) {
         sp.lora_path = model_dir;
         if (!sp.lora_path.empty() && sp.lora_path.back() != '\\' && sp.lora_path.back() != '/')
