@@ -93,6 +93,11 @@ t_token = Σ_splits (t_rt + bytes_split / BW) + t_cpu_rest
   RoPE, attention, conv, sampling on the CPU) are unknown. D1 measures t_rt and
   the whole step; t_cpu_rest is measured in D2.
 
+**Measured later:** the four-split rule undercounts. Coder-3B decode takes
+about 218 submissions per token (FA result below), 6 per layer plus the
+`lm_head`, not 145; Bielik-4.5B takes 421. See "Remaining cuts" under the bias
+ADD section for the cause and the order to remove them.
+
 Model tables (`gpustep_model()`, `include/xllama/gpustep.h`) come from the
 GGUF headers (LFM2.5 QAD Q4_0) and the Qwen2.5-3B config plus the llama.cpp
 Q4_K_M promotion rule (Coder-3B):
@@ -1010,3 +1015,98 @@ split is `[Q] [V K] [o] [gate up] [down]`; without the knob it is
 well, so the knob cannot go below 5; that needs `ROPE` on the GPU or a
 different node order. Measured on Series X: Bielik 421 → 301 submissions per
 token (60 layers × 7 → 5, plus lm_head).
+
+### ROPE on d3d12 (opt-in, step 1 of the cuts below)
+
+With `LocalState\d3d12-rope.txt` containing `1` when the backend starts (boot
+log `d3d12: rope=1`), `supports_op` accepts a `ROPE` that is F32, contiguous,
+the same shape in and out, with one I32 position per token, no `freq_factors`,
+mode NORMAL or NEOX, `ext_factor == 0` (no YaRN) and `n_offs == 0`
+(`d3d12_rope_supported`). Any other `ROPE` stays on the CPU. With the bias ADD
+on as well, Q, V and K then form one split: 5 → 4 submissions per layer.
+The knob is independent of `d3d12-bias-add.txt`, but without the bias ADD the
+bias `ADD`s still cut the split, so measure with both.
+
+The cos/sin table is computed on the CPU with ggml-cpu's formulas
+(`d3d12_rope_cache`, a copy of `rope_yarn` / `ggml_rope_cache_init` for
+`ext_factor == 0`), once per distinct set of positions and rope parameters in
+a submission (q, k and every layer share it), and staged in the same buffer as
+the other activations. The kernel (`shaders/ggml_d3d12_rope_f32.hlsl`) only
+multiplies and adds, with `precise` products and no fused multiply-add. GPU
+`sin`/`cos`/`pow` are not required to be bit-exact against libm, which is why
+the table is not computed there; other backends (Vulkan) do compute it on the
+GPU and pass llama.cpp's op-level bound. A UAV barrier fences a `ROPE` from the
+dispatches before and after it, as for the bias ADD; per-dispatch and
+per-layer lines report it as `op=rope`.
+
+Checks: the host test compares the cache + multiply emulation with
+`ggml_rope_ext` on ggml-cpu (NMSE ≤ 1e-7, the per-op bound of
+`llama.cpp/tests/test-backend-ops.cpp`); the console selftest (`d3d12be.flag`)
+runs `rope_neox` and `rope_norm` rows through the backend, direct and staged
+input, and records NMSE, max |diff| and whether the output is bit-identical
+in the `error` column. End-to-end parity stays a logit dump per arm
+(ADR 0010).
+
+Measured on Series X (operator-declared, Game designation, `long-1k`, 128
+tokens, `--gpu-layers 99`, 5 AB/BA pairs per model, A = bias ADD on, B = bias
+ADD and ROPE on; not project evidence, Series S not measured):
+
+| Model                     | Decode A → B tok/s | B/A decode          | B/A prefill | B/A TTFT | Memory |
+| ------------------------- | ------------------ | ------------------- | ----------- | -------- | ------ |
+| Bielik-4.5B-v3 Q4_K_M     | 15.19 → 16.09      | 1.056 (1.050–1.063) | 1.028       | 0.972    | +0 MB  |
+| Qwen2.5-Coder-3B Q4_K_M   | 30.54 → 32.49      | 1.064 (1.055–1.073) | 1.029       | 0.971    | −2 MB  |
+| Qwen2.5-Coder-1.5B Q4_K_M | 45.10 → 48.43      | 1.071 (1.057–1.094) | 1.035       | 0.966    | +0 MB  |
+
+Submissions per decoded token with both knobs: Bielik 241, Coder-3B 146,
+Coder-1.5B 114. The Coder models are one above "4 per layer plus `lm_head`"
+because their tied `token_embd` also runs the input lookup on the GPU (4 × L +
+2; Bielik has a separate `output.weight`, 4 × L + 1). With ROPE off Coder-1.5B
+takes 142 (5 × 28 + 2), so ROPE removes exactly one submission per layer and
+adds two dispatches per layer (Q and K): 282 → 338 per token. Per removed
+submission the wall time drops by 54 µs net of those dispatches; the added
+dispatches cost about 0.3 µs of GPU time each. Logits (`logits.flag`, every
+16th prompt position of `long-1k`, ubatch 512 and 1, all three models) are
+byte-identical between the arms, and the console selftest rows (`rope_neox`,
+`rope_norm`, direct and staged) match ggml-cpu bit for bit. Without the file
+the placement is unchanged (Coder-1.5B: 170 submissions per token).
+
+### Remaining cuts and the order to remove them (proposal)
+
+A split ends at every node the backend refuses (`ggml-backend.cpp`). The node
+dump of one layer (`llama-eval-callback`, host, `Q4_K_M`) gives the CPU nodes
+that still close a split with the bias knob on:
+
+| Cut               | Node                                                                    | Splits it costs per layer       |
+| ----------------- | ----------------------------------------------------------------------- | ------------------------------- |
+| after `[Q]`       | `ROPE` on Q                                                             | 1 (Q is separated from `[V K]`) |
+| after `[V K]`     | `ROPE` on K, then `SET_ROWS` and `FLASH_ATTN_EXT` (KV cache on the CPU) | the attention boundary          |
+| after `[o]`       | residual `ADD`, `RMS_NORM`, `MUL`                                       | 1                               |
+| after `[gate up]` | `SWIGLU`                                                                | 1                               |
+| after `[down]`    | residual `ADD`                                                          | 1, joins the next layer's norm  |
+
+Order of work, cheapest first. Estimates are linear extrapolations from the
+bias ADD result, not measurements:
+
+1. **`ROPE` on d3d12.** Q, V and K then form one split: 5 → 4 per layer (301
+   → 241 submissions per token on Bielik-4.5B). It needs `inp_pos` and the
+   rope variants the catalogue uses (mode, `freq_factors`) in
+   `d3d12_rope_supported`, a kernel, host tests next to the bias ADD ones, and
+   the same logit-parity check. The bias ADD removed 120 submissions for ×1.107
+   on Bielik-4.5B; 60 more is roughly half of that if the cost per submission
+   holds. This is the smallest step and the template for the next ones.
+2. **Elementwise ops (`RMS_NORM`+`MUL`, residual `ADD`, `SWIGLU`).** With
+   these and `ROPE` the only CPU stretch in a layer is attention, so a layer is one split: `[o … down, next qkv]`, 1 per layer.
+   This is the D2-fused direction named under "#310 re-attribution", a new
+   decision with its own gate, and it needs a GPU q8 quantize (the CPU
+   quantize costs time per submission, see `quant_ms`).
+3. **Attention and KV cache on the GPU.** The only way below 1 per layer. It conflicts
+   with the RAM budget (`offload_kqv=false` is why FA AUTO needed the fix
+   above) and is not proposed here.
+
+A reordered graph (expanding Q, V, K before `ROPE`) would give the same 5 → 4
+for every backend, but it changes llama.cpp's node order, so it would live in
+`patches/`, not in this backend. The bias-free Bielik-7B is predicted to be at
+5 per layer already (not measured).
+
+Evidence for the cut analysis (node dumps, emulator reproducing 7/5 and 6/5)
+is in #503.

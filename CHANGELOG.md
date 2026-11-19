@@ -7,6 +7,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- **Opt-in GPU ROPE for d3d12 GGUF layers.** With
+  `LocalState\d3d12-rope.txt` set to `1`, plain F32 NORMAL/NEOX `ROPE` (no
+  `freq_factors`, no YaRN) runs on the d3d12 backend, so q/k/v of a layer form
+  one split with the bias ADD knob on (5 → 4 submissions per layer). The
+  cos/sin table is computed on the CPU. Without the file, placement and graph
+  are unchanged. Logits match the CPU ROPE bit for bit; on Series X
+  (operator-declared) decode is ×1.056–1.071 over the bias ADD alone. See
+  [GGUF GPU decode](docs/gguf-gpu-decode.md).
+
 - **Opt-in GPU bias ADD for d3d12 GGUF layers (#503).** With
   `LocalState\d3d12-bias-add.txt` set to `1`, the F32 bias ADD after a
   projection runs on the d3d12 backend, so it no longer ends the GPU split.
