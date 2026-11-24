@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <random>
 #include <string>
@@ -832,5 +833,149 @@ TEST_CASE("ggml_d3d12: ROPE cache + mul/sub matches ggml-cpu rope") {
         rope_parity(mode, 8, 3, 5, 8, 10000.0f, 0.25f, 1.0f);     // freq_scale
         rope_parity(mode, 8, 3, 5, 8, 10000.0f, 1.0f, 1.3f);      // attn_factor
         rope_parity(mode, 2, 1, 3, 2, 10000.0f, 0.5f, 0.9f);      // one pair
+    }
+}
+
+namespace {
+
+std::uint32_t as_bits(float f) {
+    std::uint32_t u;
+    std::memcpy(&u, &f, sizeof(u));
+    return u;
+}
+
+float from_bits(std::uint32_t u) {
+    float f;
+    std::memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+// Byte equality of the GPU-kernel emulation against ggml's from_float.
+void check_quant_equal(ggml_type at, const std::vector<float>& x) {
+    const int k = static_cast<int>(x.size());
+    const std::size_t row = ggml_row_size(at, k);
+    std::vector<std::uint8_t> want(row), got(row, 0xcd);
+    ggml_get_type_traits_cpu(at)->from_float(x.data(), want.data(), k);
+    if (at == GGML_TYPE_Q8_0)
+        d3d12_quantize_q8_0_emulate(x.data(), k, got.data());
+    else
+        d3d12_quantize_q8_K_emulate(x.data(), k, got.data());
+    std::size_t first = row;
+    for (std::size_t i = 0; i < row; ++i)
+        if (want[i] != got[i]) {
+            first = i;
+            break;
+        }
+    CAPTURE(first);
+    CHECK(first == row);
+}
+
+} // namespace
+
+TEST_CASE("ggml_d3d12: integer fp32 division is correctly rounded") {
+    std::mt19937 rng(7);
+    std::uniform_int_distribution<std::uint32_t> any;
+    std::uniform_int_distribution<std::uint32_t> mant(0, 0x7fffffu);
+    std::uniform_int_distribution<std::uint32_t> exp_any(0, 254);
+    const auto check = [](std::uint32_t a, std::uint32_t b) {
+        const float want = from_bits(a) / from_bits(b);
+        const std::uint32_t got = d3d12_f32_div_rn(a, b);
+        if (std::isnan(want)) {
+            CHECK(std::isnan(from_bits(got)));
+            return;
+        }
+        if (got != as_bits(want)) {
+            CAPTURE(a);
+            CAPTURE(b);
+            CHECK(got == as_bits(want));
+        }
+    };
+    // Random finite operands over the whole exponent range, subnormals included.
+    for (int i = 0; i < 200000; ++i) {
+        const std::uint32_t a = (any(rng) & 0x80000000u) | (exp_any(rng) << 23) | mant(rng);
+        const std::uint32_t b = (any(rng) & 0x80000000u) | (exp_any(rng) << 23) | mant(rng);
+        check(a, b);
+    }
+    // The quotients the kernels take: max / 127, 127 / max, -127 / max, 1 / iscale.
+    for (int i = 0; i < 100000; ++i) {
+        const std::uint32_t m = (exp_any(rng) << 23) | mant(rng);
+        check(m, as_bits(127.0f));
+        check(as_bits(127.0f), m);
+        check(as_bits(-127.0f), m | 0x80000000u);
+        check(as_bits(1.0f), m);
+    }
+    const std::uint32_t special[] = {0u,          0x80000000u,   1u,           0x007fffffu,
+                                     0x00800000u, 0x7f7fffffu,   0x7f800000u,  0xff800000u,
+                                     0x7fc00000u, as_bits(1.0f), as_bits(3.0f)};
+    for (std::uint32_t a : special)
+        for (std::uint32_t b : special)
+            check(a, b);
+}
+
+TEST_CASE("ggml_d3d12: fp32 to fp16 rounding equals ggml") {
+    std::mt19937 rng(11);
+    std::uniform_int_distribution<std::uint32_t> any;
+    for (int i = 0; i < 200000; ++i) {
+        // Bias toward the fp16 range, where the rounding happens.
+        std::uint32_t u = any(rng);
+        if (i % 2)
+            u = (u & 0x807fffffu) | ((100u + (u >> 24) % 50u) << 23);
+        const float f = from_bits(u);
+        if (std::isnan(f))
+            continue;
+        const std::uint16_t want = ggml_fp32_to_fp16(f);
+        const std::uint16_t got = d3d12_f32_to_f16_rn(u);
+        if (want != got) {
+            CAPTURE(u);
+            CHECK(got == want);
+        }
+    }
+}
+
+TEST_CASE("ggml_d3d12: GPU activation quantization equals ggml byte for byte") {
+    std::mt19937 rng(3);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    const ggml_type types[] = {GGML_TYPE_Q8_0, GGML_TYPE_Q8_K};
+    for (ggml_type at : types) {
+        CAPTURE(ggml_type_name(at));
+        // Activation-like rows over many scales, including subnormal blocks.
+        const float scales[] = {1.0f, 1e-3f, 37.5f, 1e-30f, 1e-38f, 1e-42f, 3e30f};
+        for (float s : scales) {
+            CAPTURE(s);
+            // q8_K: below |max| ~ 127 / FLT_MAX iscale overflows and ggml's
+            // nearest_int asserts (Debug); not an input the reference defines.
+            if (at == GGML_TYPE_Q8_K && s < 1e-36f)
+                continue;
+            for (int rep = 0; rep < 20; ++rep) {
+                std::vector<float> x(2048);
+                for (float& v : x)
+                    v = nd(rng) * s;
+                check_quant_equal(at, x);
+            }
+        }
+        // Rounding ties: max 127 makes the multiplier exactly 1 (q8_0) or -1
+        // (q8_K), so k + 0.5 lands on a tie in both kernels.
+        std::vector<float> ties(512);
+        for (std::size_t i = 0; i < ties.size(); ++i)
+            ties[i] =
+                (i % 32 == 0) ? 127.0f : static_cast<float>(static_cast<int>(i % 200) - 100) + 0.5f;
+        check_quant_equal(at, ties);
+        // Equal magnitudes of both signs: q8_K keeps the first one's sign.
+        std::vector<float> pm(256, 0.25f);
+        pm[3] = -5.0f;
+        pm[9] = 5.0f;
+        check_quant_equal(at, pm);
+        pm[3] = 5.0f;
+        pm[9] = -5.0f;
+        check_quant_equal(at, pm);
+        // All-zero and (q8_0 only, see above) single-subnormal blocks.
+        std::vector<float> z(256, 0.0f);
+        check_quant_equal(at, z);
+        if (at == GGML_TYPE_Q8_K)
+            continue;
+        z[17] = from_bits(1u);
+        check_quant_equal(at, z);
+        z[17] = -from_bits(0x00400000u);
+        check_quant_equal(at, z);
     }
 }

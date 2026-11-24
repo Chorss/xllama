@@ -83,6 +83,38 @@ ggml_type d3d12_activation_type(ggml_type weight);
 void d3d12_quantize_activations(ggml_type weight, const float* x, std::size_t x_stride, int k,
                                 int ncols, std::uint8_t* out);
 
+// --- Activation quantization on the GPU (knob d3d12-gpu-quant.txt) ---
+// A matmul whose input another dispatch of the same submission produced can
+// only read that input after the CPU quantizes it, which ends the submission.
+// The quantize kernel does it on the GPU instead and must equal ggml-cpu's
+// quantize_row_q8_0 (x86 AVX2 path) and quantize_row_q8_K_ref byte for byte.
+// fp32 mul/add are correctly rounded on D3D12 (D3D11.3 spec §3.1.3.1, the
+// kernel is built with -denorm preserve); fp32 division is not (2.5 ULP), so
+// the kernel divides on integers. These functions are that integer algorithm,
+// line for line, so the host tests pin the shader's arithmetic against ggml.
+
+// Correctly rounded (nearest even) IEEE fp32 a / b on raw bits, subnormals
+// included; NaN inputs give a quiet NaN.
+std::uint32_t d3d12_f32_div_rn(std::uint32_t a, std::uint32_t b);
+// fp32 → fp16 bits, round to nearest even (F16C _cvtss_sh(x, 0) for finite x).
+std::uint16_t d3d12_f32_to_f16_rn(std::uint32_t a);
+// One row of k floats (k % 32 == 0) into block_q8_0, as the GPU kernel does.
+void d3d12_quantize_q8_0_emulate(const float* x, int k, std::uint8_t* out);
+// One row of k floats (k % 256 == 0) into block_q8_K, as the GPU kernel does.
+void d3d12_quantize_q8_K_emulate(const float* x, int k, std::uint8_t* out);
+
+inline constexpr int kD3d12QuantThreads = 64; // threads per group of the quantize kernel
+// Threads of work per column: one per pair of q8_0 blocks (68 B, whole dwords)
+// or per q8_K block. 0 when k does not split evenly (the matmul rules already
+// require k % 256 == 0).
+inline std::int64_t d3d12_quant_units(ggml_type activation, std::int64_t k) {
+    if (activation == GGML_TYPE_Q8_0)
+        return k > 0 && k % 64 == 0 ? k / 64 : 0;
+    if (activation == GGML_TYPE_Q8_K)
+        return k > 0 && k % 256 == 0 ? k / 256 : 0;
+    return 0;
+}
+
 // Host emulation of the shaders' per-thread lane mapping, unaligned loads and
 // algebra, on activations quantized as above: y[c*y_stride + r] ≈ W[r,:] · x_c.
 // `w` holds N rows of `w_row_bytes` packed ggml blocks. Tests and the console

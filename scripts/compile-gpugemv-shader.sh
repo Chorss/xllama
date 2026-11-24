@@ -11,8 +11,10 @@
 #   shaders/ggml_d3d12_get_rows_q6_k.hlsl → ggml_d3d12_get_rows_q6_k_dxil.h (cs_6_4)
 #   shaders/ggml_d3d12_add_bias_f32.hlsl → ggml_d3d12_add_bias_f32_dxil.h (cs_6_4,
 #     -denorm preserve so the fp32 add matches the CPU bit for bit)
+#   shaders/ggml_d3d12_quantize_q8.hlsl → ggml_d3d12_quantize_q8_{0,k}_dxil.h (cs_6_4,
+#     -denorm preserve; -D Q8_K=1 for the q8_K blob)
 #
-# Usage: compile-gpugemv-shader.sh [naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q6_k|get_rows_q6_k|add_bias_f32|rope_f32 ...]
+# Usage: compile-gpugemv-shader.sh [naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q6_k|get_rows_q6_k|add_bias_f32|rope_f32|quantize_q8_0|quantize_q8_k ...]
 #        (default: all)
 # A different dxc release emits different bytes: regenerate only the targets
 # you changed so measured blobs stay the ones the CSVs were recorded with.
@@ -113,15 +115,24 @@ compile_target() {
 		"$ROOT/shaders/generated/ggml_d3d12_rope_f32_dxil.h" \
 		"shaders/ggml_d3d12_rope_f32.hlsl -denorm preserve" "kGgmlD3d12RopeF32Dxil" \
 		cs_6_4 -denorm preserve ;;
+	quantize_q8_0) compile_one "$ROOT/shaders/ggml_d3d12_quantize_q8.hlsl" \
+		"$ROOT/shaders/generated/ggml_d3d12_quantize_q8_0_dxil.h" \
+		"shaders/ggml_d3d12_quantize_q8.hlsl -denorm preserve" "kGgmlD3d12QuantizeQ80Dxil" \
+		cs_6_4 -denorm preserve ;;
+	quantize_q8_k) compile_one "$ROOT/shaders/ggml_d3d12_quantize_q8.hlsl" \
+		"$ROOT/shaders/generated/ggml_d3d12_quantize_q8_k_dxil.h" \
+		"shaders/ggml_d3d12_quantize_q8.hlsl -D Q8_K=1 -denorm preserve" "kGgmlD3d12QuantizeQ8KDxil" \
+		cs_6_4 -D Q8_K=1 -denorm preserve ;;
 	*)
-		echo "unknown target: $1 (naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q6_k|get_rows_q6_k|add_bias_f32|rope_f32)" >&2
+		echo "unknown target: $1 (naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q6_k|get_rows_q6_k|add_bias_f32|rope_f32|quantize_q8_0|quantize_q8_k)" >&2
 		exit 2
 		;;
 	esac
 }
 
 if [[ $# -eq 0 ]]; then
-	set -- naive wave32 rows dot4 mmv_q4_0 mmv_q4_k mmv_q6_k get_rows_q6_k add_bias_f32 rope_f32
+	set -- naive wave32 rows dot4 mmv_q4_0 mmv_q4_k mmv_q6_k get_rows_q6_k add_bias_f32 rope_f32 \
+		quantize_q8_0 quantize_q8_k
 fi
 for target in "$@"; do
 	compile_target "$target"
