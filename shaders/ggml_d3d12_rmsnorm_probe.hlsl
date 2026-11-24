@@ -34,12 +34,14 @@ groupshared float sq[MAX_N];
 void CSMain(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
     const uint row = gid.y;
     const uint m = min(n, MAX_N); // the host refuses wider rows; never index past sq
+#ifndef FLOOR // the floor variant times the adds alone: no row load, no barrier
     for (uint i = tid; i < m; i += NUM_THREADS) {
         const float x = asfloat(X.Load((row * x_stride + i) * 4u));
         precise const float p = x * x;
         sq[i] = p;
     }
     GroupMemoryBarrierWithGroupSync();
+#endif
     if (tid != 0u)
         return;
     precise double s = 0.0;

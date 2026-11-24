@@ -1225,6 +1225,7 @@ struct Gpu {
     // emulation, double emulation, two-rounding mad floor).
     ComPtr<ID3D12PipelineState> pso_rmsnorm_probe[3];
     ComPtr<ID3D12PipelineState> pso_fma_probe[3];
+    bool probe_doubles = false; // D3D12_OPTIONS.DoublePrecisionFloatShaderOps
     bool rmsnorm_probe = false;
     ComPtr<ID3D12QueryHeap> ts;
     ComPtr<ID3D12Resource> ts_rb;
@@ -1479,8 +1480,7 @@ bool init_gpu(Gpu& g) {
                                                                      &opts, sizeof(opts))) &&
                              opts.DoublePrecisionFloatShaderOps;
         log_output(std::string("[xllama] d3d12: shader_doubles=") + (doubles ? "1" : "0") + "\n");
-        if (!doubles)
-            g.rmsnorm_probe = false;
+        g.probe_doubles = doubles;
     }
     if (g.rmsnorm_probe) {
         struct ProbeBlob {
@@ -1488,23 +1488,26 @@ bool init_gpu(Gpu& g) {
             const void* blob;
             size_t size;
             ComPtr<ID3D12PipelineState>* pso;
+            bool needs_doubles;
         };
         const ProbeBlob probes[] = {
             {"rmsnorm_probe", kGgmlD3d12RmsnormProbeDxil, kGgmlD3d12RmsnormProbeDxilSize,
-             &g.pso_rmsnorm_probe[0]},
+             &g.pso_rmsnorm_probe[0], true},
             {"rmsnorm_probe_u16", kGgmlD3d12RmsnormProbeU16Dxil, kGgmlD3d12RmsnormProbeU16DxilSize,
-             &g.pso_rmsnorm_probe[1]},
+             &g.pso_rmsnorm_probe[1], true},
             {"rmsnorm_probe_floor", kGgmlD3d12RmsnormProbeFloorDxil,
-             kGgmlD3d12RmsnormProbeFloorDxilSize, &g.pso_rmsnorm_probe[2]},
+             kGgmlD3d12RmsnormProbeFloorDxilSize, &g.pso_rmsnorm_probe[2], true},
             {"fma_probe_int", kGgmlD3d12FmaProbeIntDxil, kGgmlD3d12FmaProbeIntDxilSize,
-             &g.pso_fma_probe[0]},
+             &g.pso_fma_probe[0], false},
             {"fma_probe_f64", kGgmlD3d12FmaProbeF64Dxil, kGgmlD3d12FmaProbeF64DxilSize,
-             &g.pso_fma_probe[1]},
+             &g.pso_fma_probe[1], true},
             {"fma_probe_mad", kGgmlD3d12FmaProbeMadDxil, kGgmlD3d12FmaProbeMadDxilSize,
-             &g.pso_fma_probe[2]},
+             &g.pso_fma_probe[2], false},
         };
         std::string ok_list;
         for (const ProbeBlob& pb : probes) {
+            if (pb.needs_doubles && !g.probe_doubles)
+                continue; // its rows report the missing pipeline
             D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
             pd.pRootSignature = g.root.Get();
             pd.CS.pShaderBytecode = pb.blob;
@@ -3601,7 +3604,7 @@ D3d12SelftestRow run_fma_probe_case(int variant) {
     Gpu& g = gpu();
     ID3D12PipelineState* pso = g.pso_fma_probe[variant].Get();
     if (!pso) {
-        row.error = "no fma probe pipeline";
+        row.error = "no fma probe pipeline (shader_doubles=0 for f64, or PSO failed)";
         return row;
     }
     if (!g.ts || !g.ts_rb || g.ts_freq == 0) {

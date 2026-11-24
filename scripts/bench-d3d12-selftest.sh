@@ -149,12 +149,12 @@ python3 - "$OUT" "$REQUIRE_BIAS_ADD" "$REQUIRE_ROPE" "$REQUIRE_GPU_QUANT" "$REQU
 import csv, math, sys
 rows = list(csv.DictReader(open(sys.argv[1])))
 # Cost-probe rows answer a question; they are printed, not gated.
-probes = {"rmsnorm_probe", "rmsnorm_probe_u16", "rmsnorm_probe_floor",
-          "fma_probe_int", "fma_probe_f64", "fma_probe_mad"}
+# Probe-only prefixes: no gated row type starts with either.
+probes = ("rmsnorm_probe", "fma_probe_")
 for r in rows:
-    if r["type"] in probes:
+    if r["type"].startswith(probes):
         print(f"PROBE {r['type']} n={r['n']} gpu_ms={r['gpu_ms']} ok={r['ok']} {r['error']}")
-rows = [r for r in rows if r["type"] not in probes]
+rows = [r for r in rows if not r["type"].startswith(probes)]
 bad = [r for r in rows if r["ok"] != "1" or r["d3d12_ran"] != "1" or
        any(not math.isfinite(float(r[k])) or float(r[k]) < 0
            for k in ("rel_err", "gpu_ms", "packed_gbs"))]
