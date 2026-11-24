@@ -276,8 +276,14 @@ std::uint32_t d3d12_f32_div_rn(std::uint32_t a, std::uint32_t b) {
     const bool a_nan = ea == 0xffu && ma != 0, b_nan = eb == 0xffu && mb != 0;
     const bool a_inf = ea == 0xffu && ma == 0, b_inf = eb == 0xffu && mb == 0;
     const bool a_zero = ea == 0 && ma == 0, b_zero = eb == 0 && mb == 0;
-    if (a_nan || b_nan || (a_inf && b_inf) || (a_zero && b_zero))
-        return 0x7fc00000u;
+    // x86 divss returns the first NaN operand, quieted, so the payload a q8_0
+    // scale carries into its fp16 matches the CPU's.
+    if (a_nan)
+        return a | 0x400000u;
+    if (b_nan)
+        return b | 0x400000u;
+    if ((a_inf && b_inf) || (a_zero && b_zero))
+        return 0xffc00000u; // x86 default NaN
     if (a_inf || b_zero)
         return sign | 0x7f800000u;
     if (b_inf || a_zero)
@@ -346,8 +352,8 @@ std::uint16_t d3d12_f32_to_f16_rn(std::uint32_t a) {
     const std::uint32_t sign = (a >> 16) & 0x8000u;
     const std::uint32_t e = (a >> 23) & 0xffu;
     std::uint32_t m = a & 0x7fffffu;
-    if (e == 0xffu)
-        return static_cast<std::uint16_t>(sign | (m != 0 ? 0x7e00u : 0x7c00u));
+    if (e == 0xffu) // F16C keeps a NaN's sign and top payload bits, quieted
+        return static_cast<std::uint16_t>(sign | 0x7c00u | (m != 0 ? 0x200u | (m >> 13) : 0u));
     const int e16 = static_cast<int>(e) - 127 + 15;
     std::uint32_t mant, rem, half, bits;
     if (e16 >= 1) {
@@ -598,20 +604,8 @@ std::uint32_t d3d12_f32_fma_rn(std::uint32_t a, std::uint32_t b, std::uint32_t c
 
 namespace {
 
-std::uint32_t fbits(float f) {
-    std::uint32_t u;
-    std::memcpy(&u, &f, sizeof(u));
-    return u;
-}
-
-float fval(std::uint32_t u) {
-    float f;
-    std::memcpy(&f, &u, sizeof(f));
-    return f;
-}
-
 float fmadd(float a, float b, float c) {
-    return fval(d3d12_f32_fma_rn(fbits(a), fbits(b), fbits(c)));
+    return bits_f32(d3d12_f32_fma_rn(f32_bits(a), f32_bits(b), f32_bits(c)));
 }
 
 // ggml_v_expf, AVX2 + FMA, one lane. Every lane takes the same branch result
@@ -622,8 +616,8 @@ float v_expf_lane(float x) {
     const float z = fmadd(x, 0x1.715476p+0f, r);
     const float n = z - r;
     const float b = fmadd(-n, 0x1.7f7d1cp-20f, fmadd(-n, 0x1.62e4p-1f, x));
-    const std::uint32_t e = fbits(z) << 23;
-    const float k = fval(e + fbits(1.0f));
+    const std::uint32_t e = f32_bits(z) << 23;
+    const float k = bits_f32(e + f32_bits(1.0f));
     const bool c = std::fabs(n) > 126.0f;
     const float u = b * b;
     const float j = fmadd(fmadd(fmadd(0x1.0e4020p-7f, b, 0x1.573e2ep-5f), u,
@@ -632,8 +626,8 @@ float v_expf_lane(float x) {
     if (!c)
         return fmadd(j, k, k);
     const std::uint32_t g = n <= 0.0f ? 0x82000000u : 0u;
-    const float s1 = fval(g + 0x7f000000u);
-    const float s2 = fval(e - g);
+    const float s1 = bits_f32(g + 0x7f000000u);
+    const float s2 = bits_f32(e - g);
     if (std::fabs(n) > 192.0f)
         return s1 * s1;
     return fmadd(s2, j, s2) * s1;
@@ -644,7 +638,7 @@ float v_expf_lane(float x) {
 float d3d12_swiglu_emulate(float x, float g) {
     const float neg_x = 0.0f - x;
     const float den = 1.0f + v_expf_lane(neg_x);
-    const float silu = fval(d3d12_f32_div_rn(fbits(x), fbits(den)));
+    const float silu = bits_f32(d3d12_f32_div_rn(f32_bits(x), f32_bits(den)));
     return silu * g;
 }
 
@@ -657,11 +651,32 @@ bool d3d12_swiglu_supported(const D3d12SwigluDesc& d) {
            d.ne1 <= kD3d12MaxGroups;
 }
 
+namespace {
+
+// _mm256_max_ps / _mm_max_ps per lane: a > b ? a : b, so a NaN in either
+// operand yields b. The q8_0 kernel reduces |x| in the same tree as ggml's
+// AVX2 quantize_row_q8_0, so NaN inputs land where they land on the CPU.
+float max_ps(float a, float b) {
+    return a > b ? a : b;
+}
+
+float abs_bits(float v) { // _mm256_andnot_ps(-0.f, v): a NaN stays a NaN
+    return bits_f32(f32_bits(v) & 0x7fffffffu);
+}
+
+} // namespace
+
 void d3d12_quantize_q8_0_emulate(const float* x, int k, std::uint8_t* out) {
     for (int b = 0; b < k / 32; ++b, x += 32, out += 34) {
-        std::uint32_t amax = 0; // max |x| on bits: same order as floats, no FTZ
-        for (int j = 0; j < 32; ++j)
-            amax = std::max(amax, f32_bits(x[j]) & 0x7fffffffu);
+        float m[8];
+        for (int l = 0; l < 8; ++l)
+            m[l] = max_ps(max_ps(max_ps(abs_bits(x[l]), abs_bits(x[8 + l])), abs_bits(x[16 + l])),
+                          abs_bits(x[24 + l]));
+        float m4[4];
+        for (int i = 0; i < 4; ++i)
+            m4[i] = max_ps(m[4 + i], m[i]); // _mm_max_ps(high 128, low 128)
+        const float t0 = max_ps(m4[0], m4[2]), t1 = max_ps(m4[1], m4[3]); // movehl
+        const std::uint32_t amax = f32_bits(max_ps(t0, t1));              // max_ss, movehdup
         const std::uint32_t d = d3d12_f32_div_rn(amax, f32_bits(127.0f));
         const std::uint16_t dh = d3d12_f32_to_f16_rn(d);
         std::memcpy(out, &dh, 2);
@@ -688,6 +703,7 @@ void d3d12_quantize_q8_K_emulate(const float* x, int k, std::uint8_t* out) {
         float d = 0.0f;
         if (amax != 0.0f) {
             const float iscale = bits_f32(d3d12_f32_div_rn(f32_bits(-127.0f), f32_bits(max)));
+            // max is a finite non-zero float here: the strict > above skips NaN.
             for (int j = 0; j < 256; ++j) {
                 const float fv = iscale * x[j];
                 // nearest_int: the low mantissa bits of fv + 1.5 * 2^23. A
@@ -2392,8 +2408,11 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             const std::size_t bytes = static_cast<std::size_t>(row) * ncols;
             if (used + bytes > g.xq_bytes) {
                 // Growing g.xq drops what is staged, so the batch must end first;
-                // its input is then computed and the CPU path below applies.
-                if (!flush())
+                // its input is then computed and the CPU path below applies. Grow
+                // to what this batch needed so the next one fits (a prefill
+                // ubatch stages gate/up's input and down's in one submission).
+                const std::size_t want = used + bytes;
+                if (!flush() || !ensure_xq(g, want))
                     return GGML_STATUS_FAILED;
             } else {
                 Op o{node, used, row, true};
@@ -3181,6 +3200,60 @@ D3d12SelftestRow run_rope_case(ggml_backend_t backend, int mode, bool staged, in
     return row;
 }
 
+// Runs `gf` with the GPU quantize on, then off, and fills `row` (ok, note,
+// gpu_ms of the on run): the outputs `y` (count floats) must be bit-identical
+// and the graph one submission with the quantize, two without. Called only
+// with d3d12-gpu-quant.txt on; the knob is set back to on afterwards.
+void gpu_quant_on_off(ggml_backend_t backend, ggml_cgraph* gf, ggml_tensor* y, std::size_t count,
+                      D3d12SelftestRow* row) {
+    const auto run = [&](bool gpu_q, std::vector<float>* out_y, std::uint64_t* subs) {
+        Gpu& g = gpu();
+        {
+            std::lock_guard<std::mutex> lock(g.mu);
+            g.gpu_quant = gpu_q;
+        }
+        ggml_d3d12_take_stats(nullptr);
+        const bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+        D3d12PhaseStats st;
+        ggml_d3d12_take_stats(&st);
+        *subs = st.submissions;
+        out_y->resize(count);
+        if (ok)
+            ggml_backend_tensor_get(y, out_y->data(), 0, count * sizeof(float));
+        return ok;
+    };
+    std::vector<float> on, off;
+    std::uint64_t subs_on = 0, subs_off = 0;
+    const bool ran_on = run(true, &on, &subs_on);
+    row->gpu_ms = gpu().last_gpu_ms;
+    const bool ran_off = run(false, &off, &subs_off);
+    {
+        Gpu& g = gpu();
+        std::lock_guard<std::mutex> lock(g.mu);
+        g.gpu_quant = true;
+    }
+    row->d3d12_ran = ran_on && ran_off;
+    if (!row->d3d12_ran) {
+        row->error = "graph_compute failed";
+        return;
+    }
+    double max_diff = 0.0, max_ref = 0.0;
+    bool finite = true;
+    for (std::size_t i = 0; i < count; ++i) {
+        finite = finite && std::isfinite(on[i]) && std::isfinite(off[i]);
+        max_diff = std::max(max_diff, std::fabs(static_cast<double>(on[i]) - off[i]));
+        max_ref = std::max(max_ref, std::fabs(static_cast<double>(off[i])));
+    }
+    const bool identical = std::memcmp(on.data(), off.data(), count * sizeof(float)) == 0;
+    row->rel_err = max_ref > 0.0 ? max_diff / max_ref : max_diff;
+    row->ok = finite && identical && subs_on == 1 && subs_off == 2;
+    char note[96];
+    std::snprintf(note, sizeof(note), "bit_identical=%d submissions_on=%llu submissions_off=%llu",
+                  identical ? 1 : 0, static_cast<unsigned long long>(subs_on),
+                  static_cast<unsigned long long>(subs_off));
+    row->error = !finite ? "non-finite output" : note;
+}
+
 // GPU quantize (d3d12-gpu-quant.txt): y2 = W2 · (W1 · x), so the second
 // matmul's input is produced inside the submission. With the knob the backend
 // quantizes it on the GPU (one submission); without it, it ends the submission
@@ -3253,55 +3326,7 @@ D3d12SelftestRow run_quant_chain_case(ggml_backend_t backend, ggml_type wt, int 
         return row;
     }
     const std::size_t count = static_cast<std::size_t>(m) * ncols;
-    const auto run = [&](bool gpu_q, std::vector<float>* y, std::uint64_t* subs) {
-        Gpu& g = gpu();
-        {
-            std::lock_guard<std::mutex> lock(g.mu);
-            g.gpu_quant = gpu_q;
-        }
-        ggml_d3d12_take_stats(nullptr);
-        const bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
-        D3d12PhaseStats st;
-        ggml_d3d12_take_stats(&st);
-        *subs = st.submissions;
-        y->resize(count);
-        if (ok)
-            ggml_backend_tensor_get(y2, y->data(), 0, count * sizeof(float));
-        return ok;
-    };
-    std::vector<float> on, off;
-    std::uint64_t subs_on = 0, subs_off = 0;
-    const bool ran_on = run(true, &on, &subs_on);
-    row.gpu_ms = gpu().last_gpu_ms;
-    const bool ran_off = run(false, &off, &subs_off);
-    {
-        Gpu& g = gpu();
-        std::lock_guard<std::mutex> lock(g.mu);
-        g.gpu_quant = true; // only called with the knob on
-    }
-    row.d3d12_ran = ran_on && ran_off;
-    if (!row.d3d12_ran) {
-        row.error = "graph_compute failed";
-        cleanup();
-        return row;
-    }
-    double max_diff = 0.0, max_ref = 0.0;
-    bool finite = true;
-    for (std::size_t i = 0; i < count; ++i) {
-        if (!std::isfinite(on[i]) || !std::isfinite(off[i]))
-            finite = false;
-        max_diff = std::max(max_diff, std::fabs(static_cast<double>(on[i]) - off[i]));
-        max_ref = std::max(max_ref, std::fabs(static_cast<double>(off[i])));
-    }
-    const bool identical = std::memcmp(on.data(), off.data(), count * sizeof(float)) == 0;
-    row.rel_err = max_ref > 0.0 ? max_diff / max_ref : max_diff;
-    // One submission with the GPU quantize, two without (the chain's split).
-    row.ok = finite && identical && subs_on == 1 && subs_off == 2;
-    char note[96];
-    std::snprintf(note, sizeof(note), "bit_identical=%d submissions_on=%llu submissions_off=%llu",
-                  identical ? 1 : 0, static_cast<unsigned long long>(subs_on),
-                  static_cast<unsigned long long>(subs_off));
-    row.error = !finite ? "non-finite output" : note;
+    gpu_quant_on_off(backend, gf, y2, count, &row);
     cleanup();
     return row;
 }
@@ -3483,48 +3508,7 @@ D3d12SelftestRow run_ffn_chain_case(ggml_backend_t backend, ggml_type wt, int em
         return row;
     }
     const std::size_t count = static_cast<std::size_t>(embd) * ncols;
-    const auto run = [&](bool gpu_q, std::vector<float>* out_y, std::uint64_t* subs) {
-        Gpu& g = gpu();
-        {
-            std::lock_guard<std::mutex> lock(g.mu);
-            g.gpu_quant = gpu_q;
-        }
-        ggml_d3d12_take_stats(nullptr);
-        const bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
-        D3d12PhaseStats st;
-        ggml_d3d12_take_stats(&st);
-        *subs = st.submissions;
-        out_y->resize(count);
-        if (ok)
-            ggml_backend_tensor_get(y, out_y->data(), 0, count * sizeof(float));
-        return ok;
-    };
-    std::vector<float> on, off;
-    std::uint64_t subs_on = 0, subs_off = 0;
-    const bool ran_on = run(true, &on, &subs_on);
-    row.gpu_ms = gpu().last_gpu_ms;
-    const bool ran_off = run(false, &off, &subs_off);
-    {
-        Gpu& g = gpu();
-        std::lock_guard<std::mutex> lock(g.mu);
-        g.gpu_quant = true; // only called with the knob on
-    }
-    row.d3d12_ran = ran_on && ran_off;
-    if (!row.d3d12_ran) {
-        row.error = "graph_compute failed";
-        cleanup();
-        return row;
-    }
-    bool finite = true;
-    for (std::size_t i = 0; i < count; ++i)
-        finite = finite && std::isfinite(on[i]) && std::isfinite(off[i]);
-    const bool identical = std::memcmp(on.data(), off.data(), count * sizeof(float)) == 0;
-    row.ok = finite && identical && subs_on == 1 && subs_off == 2;
-    char note[96];
-    std::snprintf(note, sizeof(note), "bit_identical=%d submissions_on=%llu submissions_off=%llu",
-                  identical ? 1 : 0, static_cast<unsigned long long>(subs_on),
-                  static_cast<unsigned long long>(subs_off));
-    row.error = !finite ? "non-finite output" : note;
+    gpu_quant_on_off(backend, gf, y, count, &row);
     cleanup();
     return row;
 }

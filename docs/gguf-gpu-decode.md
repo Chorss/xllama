@@ -1182,12 +1182,19 @@ with ggml's `from_float` and require byte for byte equality, over activation-lik
 rounding ties, equal magnitudes of both signs and subnormal blocks. For
 `q8_K`, inputs whose largest magnitude is below about 127 / `FLT_MAX` are left
 out, because there the reference itself is undefined (`nearest_int` asserts in
-Debug).
+Debug). NaN inputs follow the CPU too: the `q8_0` kernel reduces `|x|` in the
+tree and with the max semantics of the AVX2 code, the division returns the
+first NaN operand and the fp16 conversion keeps the payload, as F16C does
+(host test with NaNs at every position of a block); the `q8_K` search skips a
+NaN like the reference's `>` does. The SWIGLU kernel below does not reproduce
+NaN payloads.
 
 The quantize runs only for an input in `D3D12_Host`, the buffer every output of
 a submission lands in, and only when `g.xq` already has room for it. Otherwise
 the backend ends the submission and quantizes on the CPU, as without the file,
-because growing `g.xq` would drop what is already staged. A quantized copy is
+because growing `g.xq` would drop what is already staged; it then grows `g.xq`
+to what the submission needed, so the next one (for example the next layer of
+a prefill ubatch, which stages gate/up's and down's inputs together) fits. A quantized copy is
 also dropped when a later output of the submission overlaps the input it was
 made from, since gallocr can reuse that memory.
 

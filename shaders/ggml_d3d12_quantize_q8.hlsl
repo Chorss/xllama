@@ -11,8 +11,8 @@
 //   - fp32 mul and add are correctly rounded (D3D11.3 spec §3.1.3.1); the blob
 //     is built with -denorm preserve and the products are `precise`, so no
 //     flush to zero and no fused multiply-add;
-//   - fp32 division is not correctly rounded on D3D12, so div_rn divides the
-//     significands on integers;
+//   - fp32 division is not correctly rounded on D3D12, so div_rn
+//     (ggml_d3d12_fp32_rn.hlsli) divides the significands on integers;
 //   - HLSL round() rounds half to even, like _mm256_round_ps(_MM_ROUND_NEAREST).
 // One thread per pair of q8_0 blocks (68 B, so every store is a whole dword)
 // or per q8_K block (292 B); SV_GroupID.y is the activation column.
@@ -35,81 +35,7 @@ cbuffer Params : register(b0) {
 RWByteAddressBuffer Q : register(u0);
 RWByteAddressBuffer X : register(u1);
 
-// Correctly rounded a / b on fp32 bits (d3d12_f32_div_rn).
-uint div_rn(uint a, uint b) {
-    const uint sign = (a ^ b) & 0x80000000u;
-    const uint ea = (a >> 23) & 0xffu;
-    const uint eb = (b >> 23) & 0xffu;
-    uint ma = a & 0x7fffffu;
-    uint mb = b & 0x7fffffu;
-    const bool a_nan = ea == 0xffu && ma != 0u;
-    const bool b_nan = eb == 0xffu && mb != 0u;
-    const bool a_inf = ea == 0xffu && ma == 0u;
-    const bool b_inf = eb == 0xffu && mb == 0u;
-    const bool a_zero = ea == 0u && ma == 0u;
-    const bool b_zero = eb == 0u && mb == 0u;
-    if (a_nan || b_nan || (a_inf && b_inf) || (a_zero && b_zero))
-        return 0x7fc00000u;
-    if (a_inf || b_zero)
-        return sign | 0x7f800000u;
-    if (b_inf || a_zero)
-        return sign;
-    int xa = int(ea);
-    int xb = int(eb);
-    if (ea == 0u) {
-        xa = 1;
-        while ((ma & 0x800000u) == 0u) {
-            ma <<= 1;
-            xa -= 1;
-        }
-    } else {
-        ma |= 0x800000u;
-    }
-    if (eb == 0u) {
-        xb = 1;
-        while ((mb & 0x800000u) == 0u) {
-            mb <<= 1;
-            xb -= 1;
-        }
-    } else {
-        mb |= 0x800000u;
-    }
-    int e = xa - xb + 127;
-    if (ma < mb) {
-        ma <<= 1;
-        e -= 1;
-    }
-    uint q = 0u;
-    uint r = ma;
-    [unroll] for (int i = 0; i < 26; ++i) {
-        q <<= 1;
-        if (r >= mb) {
-            r -= mb;
-            q |= 1u;
-        }
-        r <<= 1;
-    }
-    uint sticky = r != 0u ? 1u : 0u;
-    if (e >= 255)
-        return sign | 0x7f800000u;
-    const bool subnormal = e <= 0;
-    if (subnormal) {
-        const uint sh = uint(1 - e);
-        if (sh > 26u) {
-            sticky |= q != 0u ? 1u : 0u;
-            q = 0u;
-        } else {
-            sticky |= (q & ((1u << sh) - 1u)) != 0u ? 1u : 0u;
-            q >>= sh;
-        }
-    }
-    uint mant = q >> 2;
-    const uint rnd = (q >> 1) & 1u;
-    sticky |= q & 1u;
-    if (rnd != 0u && (sticky != 0u || (mant & 1u) != 0u))
-        mant += 1u;
-    return sign | (subnormal ? mant : (uint(e - 1) << 23) + mant);
-}
+#include "ggml_d3d12_fp32_rn.hlsli"
 
 float ldx(uint col, uint i) {
     return asfloat(X.Load((col * x_stride + i) * 4u));
@@ -117,13 +43,13 @@ float ldx(uint col, uint i) {
 
 #ifndef Q8_K
 
-// fp32 → fp16, round to nearest even (d3d12_f32_to_f16_rn); d is finite, >= 0.
+// fp32 → fp16 as F16C, round to nearest even (d3d12_f32_to_f16_rn).
 uint f16_rn(uint a) {
     const uint sign = (a >> 16) & 0x8000u;
     const uint e = (a >> 23) & 0xffu;
     uint m = a & 0x7fffffu;
     if (e == 0xffu)
-        return sign | (m != 0u ? 0x7e00u : 0x7c00u);
+        return sign | 0x7c00u | (m != 0u ? 0x200u | (m >> 13) : 0u);
     const int e16 = int(e) - 127 + 15;
     uint mant;
     uint rem;
@@ -153,12 +79,29 @@ uint f16_rn(uint a) {
     return sign | bits;
 }
 
+// _mm256_max_ps per lane: a NaN in either operand yields b.
+float max_ps(float a, float b) {
+    return a > b ? a : b;
+}
+
+float abs_bits(float v) { // _mm256_andnot_ps(-0.f, v)
+    return asfloat(asuint(v) & 0x7fffffffu);
+}
+
 // One q8_0 block (32 floats from element i0): 2 bytes of fp16 d in the low half
 // of `head`, the 32 quant bytes in w[0..7].
 void quant_block(uint col, uint i0, out uint head, out uint w[8]) {
-    uint amax = 0u;
-    for (uint j = 0u; j < 32u; ++j)
-        amax = max(amax, asuint(ldx(col, i0 + j)) & 0x7fffffffu);
+    // |x| reduced in the tree of ggml's AVX2 quantize_row_q8_0 with its max
+    // semantics (a > b ? a : b), so a NaN lands where it lands on the CPU.
+    float m[8];
+    [unroll] for (uint l = 0u; l < 8u; ++l)
+        m[l] = max_ps(max_ps(max_ps(abs_bits(ldx(col, i0 + l)), abs_bits(ldx(col, i0 + 8u + l))),
+                             abs_bits(ldx(col, i0 + 16u + l))),
+                      abs_bits(ldx(col, i0 + 24u + l)));
+    float m4[4];
+    [unroll] for (uint i = 0u; i < 4u; ++i)
+        m4[i] = max_ps(m[4u + i], m[i]);
+    const uint amax = asuint(max_ps(max_ps(m4[0], m4[2]), max_ps(m4[1], m4[3])));
     head = f16_rn(div_rn(amax, 0x42fe0000u)); // 127.0f
     const float id = amax != 0u ? asfloat(div_rn(0x42fe0000u, amax)) : 0.0f;
     [unroll] for (uint wi = 0u; wi < 8u; ++wi) {
@@ -206,18 +149,19 @@ void CSMain(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
     const uint col = gid.y;
     const uint i0 = u * 256u;
     const uint o = col * out_row + u * 292u;
-    // First index of the largest |x| (strict >, as quantize_row_q8_K_ref).
-    uint amax = 0u;
+    // First index of the largest |x| (strict > on floats, as
+    // quantize_row_q8_K_ref: a NaN never compares greater and is skipped).
+    float amax = 0.0f;
     float mx = 0.0f;
     for (uint j = 0u; j < 256u; ++j) {
         const float x = ldx(col, i0 + j);
-        const uint ax = asuint(x) & 0x7fffffffu;
+        const float ax = abs(x);
         if (ax > amax) {
             amax = ax;
             mx = x;
         }
     }
-    if (amax == 0u) {
+    if (amax == 0.0f) {
         for (uint z = 0u; z < 73u; ++z)
             Q.Store(o + z * 4u, 0u);
         return;

@@ -94,9 +94,10 @@ void d3d12_quantize_activations(ggml_type weight, const float* x, std::size_t x_
 // line for line, so the host tests pin the shader's arithmetic against ggml.
 
 // Correctly rounded (nearest even) IEEE fp32 a / b on raw bits, subnormals
-// included; NaN inputs give a quiet NaN.
+// included; NaNs as x86 divss (first NaN operand quieted, else the default NaN).
 std::uint32_t d3d12_f32_div_rn(std::uint32_t a, std::uint32_t b);
-// fp32 → fp16 bits, round to nearest even (F16C _cvtss_sh(x, 0) for finite x).
+// fp32 → fp16 bits as F16C _cvtss_sh(x, 0): round to nearest even, NaN payload
+// truncated.
 std::uint16_t d3d12_f32_to_f16_rn(std::uint32_t a);
 // One row of k floats (k % 32 == 0) into block_q8_0, as the GPU kernel does.
 void d3d12_quantize_q8_0_emulate(const float* x, int k, std::uint8_t* out);

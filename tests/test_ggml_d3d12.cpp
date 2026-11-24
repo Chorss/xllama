@@ -878,12 +878,9 @@ TEST_CASE("ggml_d3d12: integer fp32 division is correctly rounded") {
     std::uniform_int_distribution<std::uint32_t> mant(0, 0x7fffffu);
     std::uniform_int_distribution<std::uint32_t> exp_any(0, 254);
     const auto check = [](std::uint32_t a, std::uint32_t b) {
+        // The host's divss: NaN payloads included.
         const float want = from_bits(a) / from_bits(b);
         const std::uint32_t got = d3d12_f32_div_rn(a, b);
-        if (std::isnan(want)) {
-            CHECK(std::isnan(from_bits(got)));
-            return;
-        }
         if (got != as_bits(want)) {
             CAPTURE(a);
             CAPTURE(b);
@@ -904,9 +901,20 @@ TEST_CASE("ggml_d3d12: integer fp32 division is correctly rounded") {
         check(as_bits(-127.0f), m | 0x80000000u);
         check(as_bits(1.0f), m);
     }
-    const std::uint32_t special[] = {0u,          0x80000000u,   1u,           0x007fffffu,
-                                     0x00800000u, 0x7f7fffffu,   0x7f800000u,  0xff800000u,
-                                     0x7fc00000u, as_bits(1.0f), as_bits(3.0f)};
+    const std::uint32_t special[] = {0u,
+                                     0x80000000u,
+                                     1u,
+                                     0x007fffffu,
+                                     0x00800000u,
+                                     0x7f7fffffu,
+                                     0x7f800000u,
+                                     0xff800000u,
+                                     0x7fc00000u,
+                                     0xffc00000u,
+                                     0x7f812345u,
+                                     0xffa00001u,
+                                     as_bits(1.0f),
+                                     as_bits(3.0f)};
     for (std::uint32_t a : special)
         for (std::uint32_t b : special)
             check(a, b);
@@ -921,9 +929,13 @@ TEST_CASE("ggml_d3d12: fp32 to fp16 rounding equals ggml") {
         if (i % 2)
             u = (u & 0x807fffffu) | ((100u + (u >> 24) % 50u) << 23);
         const float f = from_bits(u);
+        // NaN payloads: ggml_cpu_fp32_to_fp16 returns the canonical NaN here,
+        // while quantize_row_q8_0's F16C conversion keeps the payload; the
+        // quantization test below checks NaN against the quantizer itself.
         if (std::isnan(f))
             continue;
-        const std::uint16_t want = ggml_fp32_to_fp16(f);
+        ggml_fp16_t want = 0;
+        ggml_cpu_fp32_to_fp16(&f, &want, 1);
         const std::uint16_t got = d3d12_f32_to_f16_rn(u);
         if (want != got) {
             CAPTURE(u);
@@ -977,6 +989,16 @@ TEST_CASE("ggml_d3d12: GPU activation quantization equals ggml byte for byte") {
         check_quant_equal(at, z);
         z[17] = -from_bits(0x00400000u);
         check_quant_equal(at, z);
+        // NaNs (q8_0 only: q8_K's nearest_int asserts on NaN in Debug) at
+        // every position of the AVX2 max tree, with payloads and both signs.
+        for (int pos = 0; pos < 32; ++pos) {
+            std::vector<float> nan_row(64);
+            for (std::size_t i = 0; i < nan_row.size(); ++i)
+                nan_row[i] = nd(rng);
+            nan_row[pos] = from_bits(pos % 2 ? 0xffc00000u : 0x7fc12345u);
+            nan_row[32 + (pos * 7) % 32] = from_bits(0x7f800001u); // signalling
+            check_quant_equal(at, nan_row);
+        }
     }
 }
 
@@ -1031,6 +1053,12 @@ TEST_CASE("ggml_d3d12: integer fp32 fma is correctly rounded") {
 }
 
 TEST_CASE("ggml_d3d12: SWIGLU emulation equals ggml-cpu bit for bit") {
+    // The reference is ggml-cpu's AVX2 + FMA vector path, the console's. A host
+    // ggml built for AVX-512 (XLLAMA_NATIVE_OPT=ON) or without FMA takes another.
+    if (!ggml_cpu_has_avx2() || !ggml_cpu_has_fma() || ggml_cpu_has_avx512()) {
+        MESSAGE("skipped: host ggml-cpu is not the AVX2 + FMA build");
+        return;
+    }
     // x spans the fast path, |n| > 126 (slow path) and |n| > 192.
     constexpr int n = 8 * 4096;
     std::mt19937 rng(23);
