@@ -517,7 +517,10 @@ std::uint32_t d3d12_f32_fma_f64(std::uint32_t a, std::uint32_t b, std::uint32_t 
     const double cd = bits_f32(c);
     volatile double s = p + cd;
     const float r = static_cast<float>(s);
-    if (!std::isfinite(s) || static_cast<double>(r) == s)
+    // r as a double; an overflow to ±inf stands for ±2^128, the float grid's
+    // next point after the largest float.
+    const double rd = std::isinf(r) ? std::copysign(0x1p128, r) : static_cast<double>(r);
+    if (!std::isfinite(s) || rd == s)
         return f32_bits(r);
     // TwoSum: err = (p + cd) - s exactly.
     volatile double bb = s - p;
@@ -525,25 +528,20 @@ std::uint32_t d3d12_f32_fma_f64(std::uint32_t a, std::uint32_t b, std::uint32_t 
     volatile double e1 = p - t1;
     volatile double e2 = cd - bb;
     const double err = e1 + e2;
-    // The float on s's other side of r; past FLT_MAX it is 2^128.
-    const std::uint32_t rb = f32_bits(r);
-    const bool up = s > static_cast<double>(r);
-    const bool away = up == (r >= 0.0f); // away from zero in magnitude
+    // nd: the float grid point on s's other side of rd.
+    const bool up = s > rd;
     double nd;
-    if (r == 0.0f)
+    if (std::isinf(r))
+        nd = std::copysign(static_cast<double>(std::numeric_limits<float>::max()), r);
+    else if (r == 0.0f)
         nd = up ? 0x1p-149 : -0x1p-149;
-    else if ((rb & 0x7fffffffu) == 0x7f7fffffu && away)
-        nd = r > 0.0f ? 0x1p128 : -0x1p128;
     else
-        nd = static_cast<double>(bits_f32(away ? rb + 1u : rb - 1u));
-    const double mid = (static_cast<double>(r) + nd) * 0.5;
+        nd = static_cast<double>(bits_f32((r > 0.0f) == up ? f32_bits(r) + 1u : f32_bits(r) - 1u));
+    const double mid = (rd + nd) * 0.5;
     if (s != mid || err == 0.0)
         return f32_bits(r);
     // s is a tie only because the double rounded: the exact sum lies on err's side.
-    const bool to_n = (err > 0.0) == up;
-    if (!to_n)
-        return f32_bits(r);
-    return f32_bits(static_cast<float>(nd)); // ±2^128 converts to ±inf
+    return (err > 0.0) == up ? f32_bits(static_cast<float>(nd)) : f32_bits(r);
 }
 
 std::uint32_t d3d12_f32_fma_rn(std::uint32_t a, std::uint32_t b, std::uint32_t c) {

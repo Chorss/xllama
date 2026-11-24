@@ -1177,15 +1177,28 @@ TEST_CASE("ggml_d3d12: fp32 fma emulations are correctly rounded") {
             for (std::uint32_t b : special)
                 for (std::uint32_t c : special)
                     check(a, b, c);
-        // Ties that only the double rounding of a * b + c creates: c far below a
-        // product whose float rounding is a tie, on either side.
+        // Ties that only the double rounding of a * b + c creates: odd 13-bit
+        // significands whose product has exactly 25 bits lie halfway between two
+        // floats; c far below decides the side. Exponents run from subnormal
+        // results to the overflow boundary.
+        std::uniform_int_distribution<std::uint32_t> odd13(2048u, 4095u);
+        std::uniform_int_distribution<int> eprod(-170, 103);
         for (int i = 0; i < 200000; ++i) {
-            const std::uint32_t a = rnd(true), b = rnd(true);
-            const float ab = from_bits(a) * from_bits(b);
-            const int e = std::ilogb(ab);
-            const float tiny = std::ldexp(1.0f, e - 60 - static_cast<int>(any(rng) % 40u));
-            check(a, b, as_bits(any(rng) % 2 ? tiny : -tiny));
+            const std::uint32_t m1 = odd13(rng) * 2u + 1u, m2 = odd13(rng) * 2u + 1u;
+            if (static_cast<std::uint64_t>(m1) * m2 >= (1u << 25))
+                continue;
+            const int ep = eprod(rng), ea = ep / 2;
+            const float a = std::ldexp(static_cast<float>(m1), ea);
+            const float b = std::ldexp(static_cast<float>(m2), ep - ea);
+            const float tiny = std::ldexp(1.0f, std::max(-149, ep - 40));
+            check(as_bits(any(rng) % 2 ? a : -a), as_bits(b), as_bits(any(rng) % 2 ? tiny : -tiny));
         }
+        // The overflow boundary: a * b = 2^128 - 2^103, halfway between FLT_MAX and
+        // 2^128 (which rounds to inf); c pulls it below or above.
+        for (const float sa : {1.0f, -1.0f})
+            for (const float sc : {1.0f, -1.0f})
+                check(as_bits(sa * std::ldexp(18631.0f, 60)), as_bits(std::ldexp(1801.0f, 43)),
+                      as_bits(sc * 0x1p-20f));
     }
 }
 
