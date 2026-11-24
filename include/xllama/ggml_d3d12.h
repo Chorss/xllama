@@ -107,6 +107,12 @@ void d3d12_quantize_q8_K_emulate(const float* x, int k, std::uint8_t* out);
 // Correctly rounded fused a * b + c on fp32 bits (_mm256_fmadd_ps), integers
 // only; NaN results are a quiet NaN.
 std::uint32_t d3d12_f32_fma_rn(std::uint32_t a, std::uint32_t b, std::uint32_t c);
+// The same result from double arithmetic (candidate for GPUs with shader
+// doubles): a * b is exact in a double, TwoSum gives the exact error of
+// s = a * b + c, and a tie that the double rounding created is resolved by
+// that error's sign. Needs correctly rounded double add/mul and double to
+// float conversion.
+std::uint32_t d3d12_f32_fma_f64(std::uint32_t a, std::uint32_t b, std::uint32_t c);
 
 // --- SWIGLU on the GPU (knob d3d12-swiglu.txt) ---
 // ggml-cpu's x86 AVX2 + FMA ggml_vec_swiglu_f32 (MSVC /arch:AVX2 defines __FMA__

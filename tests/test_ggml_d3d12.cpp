@@ -1117,54 +1117,109 @@ TEST_CASE("ggml_d3d12: quantize dispatch shape") {
     CHECK(d3d12_quant_threads(GGML_TYPE_F32) == 0);
 }
 
-TEST_CASE("ggml_d3d12: integer fp32 fma is correctly rounded") {
-    std::mt19937 rng(19);
-    std::uniform_int_distribution<std::uint32_t> any;
-    std::uniform_int_distribution<std::uint32_t> mant(0, 0x7fffffu);
-    std::uniform_int_distribution<std::uint32_t> exp_any(0, 254);
-    std::uniform_int_distribution<std::uint32_t> exp_mid(100, 154);
-    const auto check = [](std::uint32_t a, std::uint32_t b, std::uint32_t c) {
-        const float want = std::fmaf(from_bits(a), from_bits(b), from_bits(c));
-        const std::uint32_t got = d3d12_f32_fma_rn(a, b, c);
-        if (std::isnan(want)) {
-            CHECK(std::isnan(from_bits(got)));
-            return;
+TEST_CASE("ggml_d3d12: fp32 fma emulations are correctly rounded") {
+    for (const auto fma_fn : {&d3d12_f32_fma_rn, &d3d12_f32_fma_f64}) {
+        CAPTURE(fma_fn == &d3d12_f32_fma_rn ? "integer" : "double");
+        std::mt19937 rng(19);
+        std::uniform_int_distribution<std::uint32_t> any;
+        std::uniform_int_distribution<std::uint32_t> mant(0, 0x7fffffu);
+        std::uniform_int_distribution<std::uint32_t> exp_any(0, 254);
+        std::uniform_int_distribution<std::uint32_t> exp_mid(100, 154);
+        const auto check = [&](std::uint32_t a, std::uint32_t b, std::uint32_t c) {
+            const float want = std::fmaf(from_bits(a), from_bits(b), from_bits(c));
+            const std::uint32_t got = fma_fn(a, b, c);
+            if (std::isnan(want)) {
+                CHECK(std::isnan(from_bits(got)));
+                return;
+            }
+            if (got != as_bits(want)) {
+                CAPTURE(a);
+                CAPTURE(b);
+                CAPTURE(c);
+                CHECK(got == as_bits(want));
+            }
+        };
+        const auto rnd = [&](bool mid) {
+            return (any(rng) & 0x80000000u) | ((mid ? exp_mid(rng) : exp_any(rng)) << 23) |
+                   mant(rng);
+        };
+        for (int i = 0; i < 300000; ++i)
+            check(rnd(false), rnd(false), rnd(false));
+        // Close exponents: cancellation and carries.
+        for (int i = 0; i < 300000; ++i)
+            check(rnd(true), rnd(true), rnd(true));
+        // c = -(a*b) rounded: massive cancellation, the exact remainder survives.
+        for (int i = 0; i < 100000; ++i) {
+            const std::uint32_t a = rnd(true), b = rnd(true);
+            check(a, b, as_bits(-(from_bits(a) * from_bits(b))));
         }
-        if (got != as_bits(want)) {
-            CAPTURE(a);
-            CAPTURE(b);
-            CAPTURE(c);
-            CHECK(got == as_bits(want));
+        // Subnormal products and sums.
+        for (int i = 0; i < 100000; ++i) {
+            const std::uint32_t a = (any(rng) & 0x80000000u) | ((any(rng) % 40u) << 23) | mant(rng);
+            const std::uint32_t b =
+                (any(rng) & 0x80000000u) | ((100u + any(rng) % 40u) << 23) | mant(rng);
+            const std::uint32_t c = (any(rng) & 0x80000000u) | ((any(rng) % 3u) << 23) | mant(rng);
+            check(a, b, c);
         }
-    };
-    const auto rnd = [&](bool mid) {
-        return (any(rng) & 0x80000000u) | ((mid ? exp_mid(rng) : exp_any(rng)) << 23) | mant(rng);
-    };
-    for (int i = 0; i < 300000; ++i)
-        check(rnd(false), rnd(false), rnd(false));
-    // Close exponents: cancellation and carries.
-    for (int i = 0; i < 300000; ++i)
-        check(rnd(true), rnd(true), rnd(true));
-    // c = -(a*b) rounded: massive cancellation, the exact remainder survives.
-    for (int i = 0; i < 100000; ++i) {
-        const std::uint32_t a = rnd(true), b = rnd(true);
-        check(a, b, as_bits(-(from_bits(a) * from_bits(b))));
+        const std::uint32_t special[] = {0u,
+                                         0x80000000u,
+                                         1u,
+                                         0x80000001u,
+                                         0x00800000u,
+                                         0x7f7fffffu,
+                                         0xff7fffffu,
+                                         0x7f800000u,
+                                         0xff800000u,
+                                         as_bits(1.0f),
+                                         as_bits(-1.0f),
+                                         as_bits(0x1.8p23f)};
+        for (std::uint32_t a : special)
+            for (std::uint32_t b : special)
+                for (std::uint32_t c : special)
+                    check(a, b, c);
+        // Ties that only the double rounding of a * b + c creates: c far below a
+        // product whose float rounding is a tie, on either side.
+        for (int i = 0; i < 200000; ++i) {
+            const std::uint32_t a = rnd(true), b = rnd(true);
+            const float ab = from_bits(a) * from_bits(b);
+            const int e = std::ilogb(ab);
+            const float tiny = std::ldexp(1.0f, e - 60 - static_cast<int>(any(rng) % 40u));
+            check(a, b, as_bits(any(rng) % 2 ? tiny : -tiny));
+        }
     }
-    // Subnormal products and sums.
-    for (int i = 0; i < 100000; ++i) {
-        const std::uint32_t a = (any(rng) & 0x80000000u) | ((any(rng) % 40u) << 23) | mant(rng);
-        const std::uint32_t b =
-            (any(rng) & 0x80000000u) | ((100u + any(rng) % 40u) << 23) | mant(rng);
-        const std::uint32_t c = (any(rng) & 0x80000000u) | ((any(rng) % 3u) << 23) | mant(rng);
-        check(a, b, c);
-    }
-    const std::uint32_t special[] = {
-        0u,          0x80000000u, 1u,          0x80000001u,   0x00800000u,    0x7f7fffffu,
-        0xff7fffffu, 0x7f800000u, 0xff800000u, as_bits(1.0f), as_bits(-1.0f), as_bits(0x1.8p23f)};
-    for (std::uint32_t a : special)
-        for (std::uint32_t b : special)
-            for (std::uint32_t c : special)
-                check(a, b, c);
+}
+
+TEST_CASE("ggml_d3d12: double fma resolves ties the double rounding made") {
+    // (1 + 2^-12)^2 = 1 + 2^-11 + 2^-24: exactly halfway between two floats.
+    // A c far below vanishes in the double sum, so (float)(a * b + c) in
+    // doubles rounds the tie to even; the exact sum is off the tie.
+    int naive_wrong = 0;
+    for (int ea = -100; ea <= 100; ea += 7)
+        for (int eb = -100; eb <= 100; eb += 11)
+            for (const float sa : {1.0f, -1.0f})
+                for (const float sc : {1.0f, -1.0f})
+                    for (const float bm : {0.0f, 0x1p-11f}) { // 1 + 2^-10 + 3 * 2^-24 too
+                        const float a = sa * std::ldexp(1.0f + 0x1p-12f, ea);
+                        const float b = std::ldexp(1.0f + 0x1p-12f + bm, eb);
+                        const float c = sc * std::ldexp(1.0f, ea + eb - 70);
+                        const float want = std::fmaf(a, b, c);
+                        const volatile double p = static_cast<double>(a) * b;
+                        const volatile double sum = p + static_cast<double>(c);
+                        if (static_cast<float>(sum) != want)
+                            ++naive_wrong;
+                        const std::uint32_t got =
+                            d3d12_f32_fma_f64(as_bits(a), as_bits(b), as_bits(c));
+                        if (got != as_bits(want)) {
+                            CAPTURE(a);
+                            CAPTURE(b);
+                            CAPTURE(c);
+                            CHECK(got == as_bits(want));
+                        }
+                        CHECK(d3d12_f32_fma_rn(as_bits(a), as_bits(b), as_bits(c)) ==
+                              as_bits(want));
+                    }
+    CAPTURE(naive_wrong);
+    CHECK(naive_wrong > 100); // the cases do exercise the tie correction
 }
 
 TEST_CASE("ggml_d3d12: SWIGLU emulation equals ggml-cpu bit for bit") {
