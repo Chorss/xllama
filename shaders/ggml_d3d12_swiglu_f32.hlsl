@@ -8,7 +8,9 @@
 //     is built with -denorm preserve and every expression is `precise`, so
 //     nothing is fused or flushed;
 //   - _mm256_fmadd_ps is a single rounding, which HLSL cannot express for fp32:
-//     fma_rn computes it on integers (a 96-bit window in three dwords);
+//     fma_rn computes it on integers (a 96-bit window in three dwords), or,
+//     in the blob built with -D FMA_F64=1 for GPUs with shader doubles,
+//     fma_f64 from doubles (same bits for non-NaN results, shorter chain);
 //   - _mm256_div_ps is correctly rounded, D3D12 division is not: div_rn.
 // One thread per element; SV_GroupID.y is the activation column. Each thread
 // reads both inputs before writing, so Y may alias either input.
@@ -35,7 +37,11 @@ RWByteAddressBuffer U : register(u2);
 #include "ggml_d3d12_fp32_rn.hlsli"
 
 float fmadd(float a, float b, float c) {
+#ifdef FMA_F64
+    return asfloat(fma_f64(asuint(a), asuint(b), asuint(c)));
+#else
     return asfloat(fma_rn(asuint(a), asuint(b), asuint(c)));
+#endif
 }
 
 // ggml_v_expf (AVX2 + FMA), one lane (v_expf_lane).

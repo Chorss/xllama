@@ -185,6 +185,9 @@ class D3d12SelftestExitTests(unittest.TestCase):
             ([dict(quant[0], ok="0")] + quant[1:], ["0", "0", "1", "0"], False),
             (swiglu, ["0", "0", "0", "1"], True),
             (swiglu[1:] + swiglu[:1], ["0", "0", "0", "1"], False),
+            (swiglu + [dict(base, type="swiglu_int", ncols="7")], ["0", "0", "0", "1"], True),
+            (swiglu + [dict(base, type="swiglu_int", ncols="7", ok="0")], ["0", "0", "0", "1"],
+             False),
             (swiglu, ["0", "0", "1", "1"], False),  # both knobs: quant and ffn rows too
             (quant + swiglu, ["0", "0", "1", "1"], False),  # ffn rows missing
             (quant + swiglu + ffn, ["0", "0", "1", "1"], True),

@@ -637,40 +637,44 @@ std::uint32_t d3d12_f32_fma_rn(std::uint32_t a, std::uint32_t b, std::uint32_t c
 
 namespace {
 
-float fmadd(float a, float b, float c) {
-    return bits_f32(d3d12_f32_fma_rn(f32_bits(a), f32_bits(b), f32_bits(c)));
+using FmaBits = std::uint32_t (*)(std::uint32_t, std::uint32_t, std::uint32_t);
+
+// The kernel's fmadd: the integer or the double emulation (same result).
+float fmadd(FmaBits f, float a, float b, float c) {
+    return bits_f32(f(f32_bits(a), f32_bits(b), f32_bits(c)));
 }
 
 // ggml_v_expf, AVX2 + FMA, one lane. Every lane takes the same branch result
 // whatever its neighbours do: the slow path blends per lane, and its !c lanes
 // compute fma(k, j, k) == fma(j, k, k).
-float v_expf_lane(float x) {
+float v_expf_lane(float x, FmaBits f) {
     const float r = 0x1.8p23f;
-    const float z = fmadd(x, 0x1.715476p+0f, r);
+    const float z = fmadd(f, x, 0x1.715476p+0f, r);
     const float n = z - r;
-    const float b = fmadd(-n, 0x1.7f7d1cp-20f, fmadd(-n, 0x1.62e4p-1f, x));
+    const float b = fmadd(f, -n, 0x1.7f7d1cp-20f, fmadd(f, -n, 0x1.62e4p-1f, x));
     const std::uint32_t e = f32_bits(z) << 23;
     const float k = bits_f32(e + f32_bits(1.0f));
     const bool c = std::fabs(n) > 126.0f;
     const float u = b * b;
-    const float j = fmadd(fmadd(fmadd(0x1.0e4020p-7f, b, 0x1.573e2ep-5f), u,
-                                fmadd(0x1.555e66p-3f, b, 0x1.fffdb6p-2f)),
+    const float j = fmadd(f,
+                          fmadd(f, fmadd(f, 0x1.0e4020p-7f, b, 0x1.573e2ep-5f), u,
+                                fmadd(f, 0x1.555e66p-3f, b, 0x1.fffdb6p-2f)),
                           u, 0x1.ffffecp-1f * b);
     if (!c)
-        return fmadd(j, k, k);
+        return fmadd(f, j, k, k);
     const std::uint32_t g = n <= 0.0f ? 0x82000000u : 0u;
     const float s1 = bits_f32(g + 0x7f000000u);
     const float s2 = bits_f32(e - g);
     if (std::fabs(n) > 192.0f)
         return s1 * s1;
-    return fmadd(s2, j, s2) * s1;
+    return fmadd(f, s2, j, s2) * s1;
 }
 
 } // namespace
 
-float d3d12_swiglu_emulate(float x, float g) {
+float d3d12_swiglu_emulate(float x, float g, bool fma_f64) {
     const float neg_x = 0.0f - x;
-    const float den = 1.0f + v_expf_lane(neg_x);
+    const float den = 1.0f + v_expf_lane(neg_x, fma_f64 ? d3d12_f32_fma_f64 : d3d12_f32_fma_rn);
     const float silu = bits_f32(d3d12_f32_div_rn(f32_bits(x), f32_bits(den)));
     return silu * g;
 }
@@ -1171,6 +1175,7 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         #include "ggml_d3d12_rmsnorm_probe_u16_dxil.h"
         #include "ggml_d3d12_rope_f32_dxil.h"
         #include "ggml_d3d12_swiglu_f32_dxil.h"
+        #include "ggml_d3d12_swiglu_f32_f64_dxil.h"
         #include "xllama/d3d12_dyn.h"
         #include "xllama/path_utils.h"
         #include "xllama/platform.h"
@@ -1225,7 +1230,11 @@ struct Gpu {
     // emulation, double emulation, two-rounding mad floor).
     ComPtr<ID3D12PipelineState> pso_rmsnorm_probe[3];
     ComPtr<ID3D12PipelineState> pso_fma_probe[3];
-    bool probe_doubles = false; // D3D12_OPTIONS.DoublePrecisionFloatShaderOps
+    bool shader_doubles = false; // D3D12_OPTIONS.DoublePrecisionFloatShaderOps (queried on use)
+    // The integer-fma SWIGLU blob kept beside an active f64 one, so the
+    // selftest covers both (same output).
+    ComPtr<ID3D12PipelineState> pso_swiglu_int;
+    bool swiglu_f64 = false; // pso_swiglu is the FMA_F64 blob
     bool rmsnorm_probe = false;
     ComPtr<ID3D12QueryHeap> ts;
     ComPtr<ID3D12Resource> ts_rb;
@@ -1454,16 +1463,55 @@ bool init_gpu(Gpu& g) {
         }
     }
     log_output(std::string("[xllama] d3d12: gpu_quant=") + (g.gpu_quant ? "1" : "0") + "\n");
+    // Shader doubles, queried and logged once, only for an opt-in that uses them.
+    int doubles_state = -1;
+    const auto shader_doubles = [&]() {
+        if (doubles_state < 0) {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS opts = {};
+            doubles_state = SUCCEEDED(g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS,
+                                                                    &opts, sizeof(opts))) &&
+                                    opts.DoublePrecisionFloatShaderOps
+                                ? 1
+                                : 0;
+            g.shader_doubles = doubles_state == 1;
+            log_output(std::string("[xllama] d3d12: shader_doubles=") +
+                       (g.shader_doubles ? "1" : "0") + "\n");
+        }
+        return doubles_state == 1;
+    };
     if (g.swiglu) { // knob read before the root signature, which it shapes
+        // Two blobs with the same output (NaN payloads aside): fma from doubles
+        // where the device has shader doubles (shorter chain), else on integers.
+        const bool doubles = shader_doubles();
         D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
         pd.pRootSignature = g.root.Get();
-        pd.CS.pShaderBytecode = kGgmlD3d12SwigluF32Dxil;
-        pd.CS.BytecodeLength = kGgmlD3d12SwigluF32DxilSize;
-        hr = g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_swiglu));
+        pd.CS.pShaderBytecode = kGgmlD3d12SwigluF32F64Dxil;
+        pd.CS.BytecodeLength = kGgmlD3d12SwigluF32F64DxilSize;
+        hr = doubles ? g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_swiglu))
+                     : E_NOTIMPL;
+        const bool f64 = SUCCEEDED(hr);
+        if (doubles && !f64)
+            log_output("[xllama] d3d12: SWIGLU f64 blob unavailable, integer fma: " +
+                       d3d12c::hr_message("CreateComputePipelineState", hr) + "\n");
+        if (!f64) {
+            pd.CS.pShaderBytecode = kGgmlD3d12SwigluF32Dxil;
+            pd.CS.BytecodeLength = kGgmlD3d12SwigluF32DxilSize;
+            hr = g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_swiglu));
+        }
         if (FAILED(hr)) {
             log_output("[xllama] d3d12: SWIGLU unavailable: " +
                        d3d12c::hr_message("CreateComputePipelineState", hr) + "\n");
             g.swiglu = false;
+        } else {
+            log_output(std::string("[xllama] d3d12: swiglu_fma=") + (f64 ? "f64" : "int") + "\n");
+            g.swiglu_f64 = f64;
+            if (f64) {
+                pd.CS.pShaderBytecode = kGgmlD3d12SwigluF32Dxil;
+                pd.CS.BytecodeLength = kGgmlD3d12SwigluF32DxilSize;
+                if (FAILED(
+                        g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_swiglu_int))))
+                    g.pso_swiglu_int.Reset(); // the selftest then skips the swiglu_int row
+            }
         }
     }
     log_output(std::string("[xllama] d3d12: swiglu=") + (g.swiglu ? "1" : "0") + "\n");
@@ -1474,14 +1522,8 @@ bool init_gpu(Gpu& g) {
         std::fclose(f);
         g.rmsnorm_probe = d3d12_flag_enabled(std::string_view(config, bytes));
     }
-    if (g.rmsnorm_probe) {
-        D3D12_FEATURE_DATA_D3D12_OPTIONS opts = {};
-        const bool doubles = SUCCEEDED(g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS,
-                                                                     &opts, sizeof(opts))) &&
-                             opts.DoublePrecisionFloatShaderOps;
-        log_output(std::string("[xllama] d3d12: shader_doubles=") + (doubles ? "1" : "0") + "\n");
-        g.probe_doubles = doubles;
-    }
+    if (g.rmsnorm_probe)
+        shader_doubles();
     if (g.rmsnorm_probe) {
         struct ProbeBlob {
             const char* name;
@@ -1506,7 +1548,7 @@ bool init_gpu(Gpu& g) {
         };
         std::string ok_list;
         for (const ProbeBlob& pb : probes) {
-            if (pb.needs_doubles && !g.probe_doubles)
+            if (pb.needs_doubles && !g.shader_doubles)
                 continue; // its rows report the missing pipeline
             D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
             pd.pRootSignature = g.root.Get();
@@ -3902,7 +3944,8 @@ D3d12SelftestRow run_swiglu_case(ggml_backend_t backend, bool staged, int n, int
     row.rel_err = max_ref > 0.0 ? max_diff / max_ref : max_diff;
     row.ok = ref_ok && diff == 0;
     char note[64];
-    std::snprintf(note, sizeof(note), "mismatched=%zu", diff);
+    std::snprintf(note, sizeof(note), "mismatched=%zu fma=%s", diff,
+                  gpu().swiglu_f64 ? "f64" : "int");
     row.error = !ref_ok ? "cpu reference failed" : note;
     cleanup();
     return row;
@@ -4054,6 +4097,20 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
     if (gpu().swiglu) { // the in-place decode row ran first, above
         out->push_back(run_swiglu_case(backend, false, 11008, 7));
         out->push_back(run_swiglu_case(backend, true, 8192, 3));
+        // The integer-fma blob too when the f64 one is active (same output).
+        if (gpu().pso_swiglu_int) {
+            const auto swap_blobs = [] {
+                Gpu& g = gpu();
+                std::lock_guard<std::mutex> lock(g.mu);
+                g.pso_swiglu.Swap(g.pso_swiglu_int);
+                g.swiglu_f64 = !g.swiglu_f64;
+            };
+            swap_blobs();
+            D3d12SelftestRow r = run_swiglu_case(backend, false, 11008, 7);
+            swap_blobs();
+            r.type = "swiglu_int";
+            out->push_back(std::move(r));
+        }
         if (gpu().gpu_quant) {
             out->push_back(run_ffn_chain_case(backend, GGML_TYPE_Q4_0, 2048, 8192, 1));
             out->push_back(run_ffn_chain_case(backend, GGML_TYPE_Q4_K, 2048, 11008, 1));

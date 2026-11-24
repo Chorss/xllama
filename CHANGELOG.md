@@ -22,7 +22,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `LocalState\d3d12-swiglu.txt` set to `1` runs `SWIGLU` (separate gate and up,
   `ne0` a multiple of 8) on the GPU. Both kernels are written to reproduce
   the console's ggml-cpu code exactly (AVX2 `quantize_row_q8_0`, scalar
-  `quantize_row_q8_K_ref`, AVX2 + FMA SWIGLU), with integer division and fma where
+  `quantize_row_q8_K_ref`, AVX2 + FMA SWIGLU), with integer division and an exact
+  fma (from doubles where the device has shader doubles, else on integers; same
+  bits for non-NaN results) where
   D3D12 fp32 arithmetic is not correctly rounded; the host tests and the console
   selftest rows require identical bits. With both files the FFN of a layer is
   one submission. Not measured on Series S. Details:

@@ -117,10 +117,12 @@ std::uint32_t d3d12_f32_fma_f64(std::uint32_t a, std::uint32_t b, std::uint32_t 
 // --- SWIGLU on the GPU (knob d3d12-swiglu.txt) ---
 // ggml-cpu's x86 AVX2 + FMA ggml_vec_swiglu_f32 (MSVC /arch:AVX2 defines __FMA__
 // through ggml-cpu-impl.h): y = silu(x) * g, silu(x) = x / (1 + ggml_v_expf(-x)).
-// One element of that, lane for lane, on fp32 bits with the integer fma and
-// division above; the kernel runs the same code. Only the vector body is
-// reproduced, so the rules require ne0 % 8 == 0 (no scalar libm tail).
-float d3d12_swiglu_emulate(float x, float g);
+// One element of that, lane for lane, on fp32 bits with an exact fma and the
+// integer division above; the kernel runs the same code. Only the vector body
+// is reproduced, so the rules require ne0 % 8 == 0 (no scalar libm tail).
+// fma_f64 selects d3d12_f32_fma_f64 (the kernel's blob for GPUs with shader
+// doubles) over d3d12_f32_fma_rn; same bits for every non-NaN result.
+float d3d12_swiglu_emulate(float x, float g, bool fma_f64 = false);
 
 struct D3d12SwigluDesc {
     ggml_type src0_type = GGML_TYPE_F32, src1_type = GGML_TYPE_F32, dst_type = GGML_TYPE_F32;

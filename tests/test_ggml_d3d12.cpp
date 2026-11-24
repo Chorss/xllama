@@ -1269,21 +1269,24 @@ TEST_CASE("ggml_d3d12: SWIGLU emulation equals ggml-cpu bit for bit") {
     ggml_build_forward_expand(gf, y);
     REQUIRE(ggml_graph_compute_with_ctx(ctx, gf, 1) == GGML_STATUS_SUCCESS);
     const auto* want = static_cast<const float*>(y->data);
-    int mismatches = 0, first = -1;
-    for (int i = 0; i < n; ++i) {
-        const float got = d3d12_swiglu_emulate(xs[i], gs[i]);
-        if (std::memcmp(&got, &want[i], sizeof(float)) != 0) {
-            if (first < 0)
-                first = i;
-            ++mismatches;
+    for (const bool fma_f64 : {false, true}) {
+        CAPTURE(fma_f64);
+        int mismatches = 0, first = -1;
+        for (int i = 0; i < n; ++i) {
+            const float got = d3d12_swiglu_emulate(xs[i], gs[i], fma_f64);
+            if (std::memcmp(&got, &want[i], sizeof(float)) != 0) {
+                if (first < 0)
+                    first = i;
+                ++mismatches;
+            }
         }
+        CAPTURE(first);
+        const float x_first = first >= 0 ? xs[first] : 0.0f; // CAPTURE ends at its scope
+        const float g_first = first >= 0 ? gs[first] : 0.0f;
+        CAPTURE(x_first);
+        CAPTURE(g_first);
+        CHECK(mismatches == 0);
     }
-    CAPTURE(first);
-    if (first >= 0) {
-        CAPTURE(xs[first]);
-        CAPTURE(gs[first]);
-    }
-    CHECK(mismatches == 0);
     ggml_free(ctx);
 }
 

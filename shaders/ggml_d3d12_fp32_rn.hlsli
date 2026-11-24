@@ -1,9 +1,10 @@
 // ggml backend d3d12: correctly rounded fp32 helpers on integers, shared by
 // the quantize and SWIGLU kernels. D3D12 fp32 division is not correctly
 // rounded and HLSL has no fp32 fused multiply-add, so the kernels that must
-// equal ggml-cpu bit for bit compute these two on integers. Host twins (tested
-// against the CPU's IEEE results): d3d12_f32_div_rn, d3d12_f32_fma_rn
-// (src/bridge/ggml_d3d12.cpp).
+// equal ggml-cpu bit for bit compute these two on integers (and, under
+// FMA_F64, the fma from doubles: same bits for non-NaN results). Host twins (tested
+// against the CPU's IEEE results): d3d12_f32_div_rn, d3d12_f32_fma_rn,
+// d3d12_f32_fma_f64 (src/bridge/ggml_d3d12.cpp).
 
 // --- 96-bit unsigned integers, x = lowest dword ---
 
@@ -283,3 +284,44 @@ uint div_rn(uint a, uint b) {
         mant += 1u;
     return sign | (subnormal ? mant : (uint(e - 1) << 23) + mant);
 }
+
+#ifdef FMA_F64
+// The same correctly rounded a * b + c from double arithmetic, for GPUs with
+// shader doubles (d3d12_f32_fma_f64): a * b is exact in a double, TwoSum gives
+// the exact error of s = a * b + c, and a tie that the double rounding made is
+// resolved by that error's sign. Needs D3D12_OPTIONS.DoublePrecisionFloatShaderOps;
+// only blobs built with -D FMA_F64=1 use doubles.
+uint fma_f64(uint a, uint b, uint c) {
+    precise const double p = (double)asfloat(a) * (double)asfloat(b);
+    precise const double cd = (double)asfloat(c);
+    precise const double s = p + cd;
+    const float r = (float)s;
+    const uint rb = asuint(r);
+    const bool r_inf = (rb & 0x7fffffffu) == 0x7f800000u;
+    const bool r_neg = (rb & 0x80000000u) != 0u;
+    // An overflow to ±inf stands for ±2^128, the grid point after FLT_MAX.
+    const double rd = r_inf ? (r_neg ? asdouble(0u, 0xc7f00000u) : asdouble(0u, 0x47f00000u))
+                            : (double)r;
+    uint slo, shi;
+    asuint(s, slo, shi);
+    if (((shi >> 20) & 0x7ffu) == 0x7ffu || rd == s)
+        return rb;
+    precise const double bb = s - p;
+    precise const double t1 = s - bb;
+    precise const double e1 = p - t1;
+    precise const double e2 = cd - bb;
+    precise const double err = e1 + e2;
+    const bool up = s > rd;
+    double nd;
+    if (r_inf)
+        nd = (double)asfloat((rb & 0x80000000u) | 0x7f7fffffu); // ±FLT_MAX
+    else if (r == 0.0f)
+        nd = up ? asdouble(0u, 0x36a00000u) : asdouble(0u, 0xb6a00000u); // ±2^-149
+    else
+        nd = (double)asfloat((r > 0.0f) == up ? rb + 1u : rb - 1u);
+    precise const double mid = (rd + nd) * 0.5;
+    if (s != mid || err == 0.0)
+        return rb;
+    return (err > 0.0) == up ? asuint((float)nd) : rb;
+}
+#endif

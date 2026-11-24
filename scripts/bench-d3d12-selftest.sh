@@ -197,9 +197,12 @@ if require_gpu_quant and not bytes_ok:
     print(f"FAIL expected one quant_q8_K_bytes row; found {kind('quant_q8_K_bytes')}")
 # The in-place decode row runs first (cold scratch), the rest after the matmuls.
 swiglu_expected = [("swiglu", "1"), ("swiglu", "7"), ("swiglu_staged", "3")]
-swiglu_ok = kind("swiglu") == swiglu_expected
+# swiglu_int (the integer-fma blob beside an active f64 one) is optional; it
+# must pass like every row but is not part of the required sequence.
+swiglu_got = [q for q in kind("swiglu") if q[0] != "swiglu_int"]
+swiglu_ok = swiglu_got == swiglu_expected
 if require_swiglu and not swiglu_ok:
-    print(f"FAIL expected the three swiglu rows {swiglu_expected}; found {kind('swiglu')}")
+    print(f"FAIL expected the three swiglu rows {swiglu_expected}; found {swiglu_got}")
 ffn_expected = [("ffn_q4_0", "1"), ("ffn_q4_K", "1"), ("ffn_q6_K", "7")]
 ffn_ok = kind("ffn_") == ffn_expected
 if require_swiglu and require_gpu_quant and not ffn_ok:

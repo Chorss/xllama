@@ -1259,14 +1259,32 @@ The kernel (`shaders/ggml_d3d12_swiglu_f32.hlsl`) reproduces the console's
 ggml-cpu path lane for lane: `ggml_vec_swiglu_f32` in its AVX2 + FMA form (MSVC
 `/arch:AVX2` defines `__FMA__` through `ggml-cpu-impl.h`), that is,
 `silu(x) = x / (1 + ggml_v_expf(-x))` times up. HLSL has no fused multiply-add
-for fp32, so `_mm256_fmadd_ps` is a correctly rounded fma on integers
-(`d3d12_f32_fma_rn`, a 96-bit window in three dwords), the division is the
+for fp32, so `_mm256_fmadd_ps` is a correctly rounded fma, on integers
+(`d3d12_f32_fma_rn`, a 96-bit window in three dwords) or from doubles (below),
+the division is the
 integer `div_rn` above, and every other step is a `precise` fp32 operation
 with `-denorm preserve`. The host tests compare the integer fma with
 `std::fmaf` (random operands over the whole range, cancellation, subnormal
 results, special values), and they compare the element emulation (`d3d12_swiglu_emulate`)
 with a real ggml SWIGLU graph on the host, whose ggml-cpu build takes the same
 AVX2 + FMA path; they require identical bits, including the `exp` slow path (`|n| > 126`).
+
+The kernel is built twice. On a device that reports
+`D3D12_OPTIONS.DoublePrecisionFloatShaderOps`, the backend uses the blob built
+with `-D FMA_F64=1`, which computes the same correctly rounded fma from
+doubles (`d3d12_f32_fma_f64`). `a * b` is exact in a double. TwoSum gives the
+exact error of the double sum `a * b + c`. A tie between two floats that only
+the double rounding created is resolved toward that error's sign; an overflow
+to inf counts as 2^128 on the float grid. The boot log says
+`d3d12: swiglu_fma=f64`, or `swiglu_fma=int` for the integer blob. Both give
+the same bits for every non-NaN result (NaN payloads are not reproduced, as
+noted above). With the f64 blob active the selftest also runs a `swiglu_int`
+row on the integer blob, so both stay checked on the console. If the
+double blob fails to build, the backend logs that and uses the integer one.
+The host tests run the double fma over the same inputs as the integer one.
+They add ties the double rounding creates (odd 13-bit significands whose product
+has exactly 25 bits, from subnormal results to the overflow boundary). They
+also run the SWIGLU element emulation through both fmas against ggml.
 
 With both knobs, gate, up, SWIGLU and down can share one submission, so a
 model whose bias `ADD`s and `ROPE` are already on the GPU is expected to go from
@@ -1290,7 +1308,7 @@ ADD margins, accepts Qwen2.5-Coder-1.5B/3B and LFM2.5-1.2B (SWIGLU FFN, no
 biases) and requires fewer decode and no more prefill submissions in B in every
 pair. Not measured on Series S. The DXIL blobs for both knobs were generated
 with dxc 1.9.2609 (`scripts/compile-gpugemv-shader.sh quantize_q8_0
-quantize_q8_k swiglu_f32`).
+quantize_q8_k swiglu_f32 swiglu_f32_f64`).
 
 ### Remaining cuts and the order to remove them (proposal)
 
