@@ -3,6 +3,7 @@
 
 #include "xllama/inference.h"
 #include "xllama/chat_prompt.h"
+#include "xllama/cpu_tuning.h"
 #include "xllama/logit_dump.h"
 #include "xllama/path_utils.h"
 #include "xllama/platform.h"
@@ -645,6 +646,13 @@ InferenceResult run_inference_llama(const InferenceParams& params) {
     // Prefill runs on n_threads_batch (default 4, independent of n_threads) —
     // see LlamaSession::generate and #168.
     cparams.n_threads_batch = n_threads;
+    // CPU knobs (cpu_tuning.h): read only for a d3d12 run, the one whose CPU
+    // part is split into many small graphs. decode_threads.txt resizes the
+    // decode pool; prefill keeps n_threads.
+    const CpuDecodeTuning cpu_tuning =
+        gpu_layers > 0 ? read_cpu_decode_tuning() : CpuDecodeTuning{};
+    if (cpu_tuning.decode_threads > 0)
+        cparams.n_threads = cpu_tuning.decode_threads;
     if (params.n_batch > 0)
         cparams.n_batch = static_cast<uint32_t>(params.n_batch);
     if (params.n_ubatch > 0)
@@ -713,8 +721,13 @@ InferenceResult run_inference_llama(const InferenceParams& params) {
     }
     LlamaContextPtr ctx(raw_ctx);
     log_gguf_ws("after context");
+    // Before attach: pool workers read the flag. Always set, so a CPU-only run
+    // after a d3d12 one in the same process goes back to the upstream spin.
+    apply_cpu_relax_pause(cpu_tuning.relax_pause);
     cpu_pools.attach(gpu_layers, ctx.get(), static_cast<int>(cparams.n_threads),
-                     static_cast<int>(cparams.n_threads_batch));
+                     static_cast<int>(cparams.n_threads_batch), cpu_tuning.decode_poll);
+    if (cpu_tuning.any())
+        log_output(format_cpu_tuning(cpu_tuning, static_cast<int>(cparams.n_threads_batch)));
 
     if (adapter) {
         llama_adapter_lora* arr[1] = {adapter.get()};
@@ -896,8 +909,13 @@ InferenceResult run_inference_llama(const InferenceParams& params) {
     dlp.ignore_eog = params.ignore_eog;
     dlp.token_history = params.prompt_lookup ? &gen_history : nullptr;
     dlp.watchdog = &wd;
+    CpuPhaseTimes cpu_times;
+    if (cpu_tuning.timing && !params.prompt_lookup)
+        dlp.cpu_times = &cpu_times;
     wd.enter_decode(params.n_predict);
     const DecodeLoopResult dlr = decode_loop(dlp, res.output_text);
+    if (dlp.cpu_times)
+        log_output(format_cpu_phase("decode", cpu_times));
     if (gpu_layers > 0 && ggml_d3d12_take_stats(&d3d12_phase)) {
         log_output(format_d3d12_phase("decode", d3d12_phase));
         const std::string per = format_d3d12_dispatch_profile("decode", d3d12_phase.dispatch);

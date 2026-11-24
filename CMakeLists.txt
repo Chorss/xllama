@@ -85,6 +85,7 @@ add_library(xllama STATIC
     src/bridge/capture_probe.cpp
     src/bridge/d3d12_compute.cpp
     src/bridge/ggml_d3d12.cpp
+    src/bridge/cpu_tuning.cpp
 )
 
 # Optional benchmarking probes (membw, diskbw, gpubw, gpugemv, gpustep, ramceil)

@@ -61,6 +61,7 @@ add_executable(xllama-tests
     test_autopilot.cpp
     test_speculative.cpp
     test_capture_probe.cpp
+    test_cpu_tuning.cpp
 )
 
 target_link_libraries(xllama-tests PRIVATE xllama doctest::doctest)

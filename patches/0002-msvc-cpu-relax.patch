@@ -1,0 +1,32 @@
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 7c274c03b..2ca610a4a 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -516,6 +516,14 @@ struct ggml_compute_state {
+     int ith;
+ };
+ 
++// xllama (patches/0002-msvc-cpu-relax.patch): MSVC defines _M_X64, not
++// __x86_64__, so the spin loops below compiled to the empty relax and spun
++// without a pause. Set from the LocalState knob cpu-relax-pause.txt; 0 keeps
++// upstream behaviour so the knob can be A/B-ed in one package.
++#if defined(_WIN32)
++int xllama_ggml_cpu_relax_pause = 0;
++#endif
++
+ // Helpers for polling loops
+ #if defined(__aarch64__) && ( defined(__clang__) || defined(__GNUC__) )
+ static inline void ggml_thread_cpu_relax(void) {
+@@ -525,6 +533,12 @@ static inline void ggml_thread_cpu_relax(void) {
+ static inline void ggml_thread_cpu_relax(void) {
+     _mm_pause();
+ }
++#elif defined(_M_X64) || defined(_M_IX86)
++static inline void ggml_thread_cpu_relax(void) {
++    if (xllama_ggml_cpu_relax_pause) {
++        _mm_pause();
++    }
++}
+ #elif defined(__riscv)
+ static inline void ggml_thread_cpu_relax(void) {
+     #ifdef __riscv_zihintpause

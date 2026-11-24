@@ -6,6 +6,7 @@
 
 #include "llama.h"
 #include "xllama/chat_prompt.h"        // apply_stop_sequences
+#include "xllama/cpu_tuning.h"         // CpuPhaseTimes (cpu-timing.txt)
 #include "xllama/inference_progress.h" // prefill/decode progress + stall watchdog
 #include "xllama/platform.h"           // log_output
 #include "xllama/speculative.h"        // prompt_lookup_draft (#210)
@@ -120,6 +121,10 @@ struct DecodeLoopParams {
 
     // Optional stall watchdog / decode-progress logger. Shared with prefill.
     InferenceWatchdog* watchdog = nullptr;
+
+    // cpu-timing.txt: time the sampler, emit and llama_decode of the classic
+    // single-token path (a speculative verify batch is not counted). Null = off.
+    CpuPhaseTimes* cpu_times = nullptr;
 };
 
 struct DecodeLoopResult {
@@ -260,14 +265,27 @@ inline bool classic_step(const DecodeLoopParams& p, llama_token token, std::stri
                          DecodeLoopResult& out, bool& stop, bool& decode_ok) {
     stop = false;
     decode_ok = true;
-    if (emit_token(p, token, output_text)) {
+    using clock = std::chrono::steady_clock;
+    const auto t0 = p.cpu_times ? clock::now() : clock::time_point{};
+    const bool stopped = emit_token(p, token, output_text);
+    if (p.cpu_times)
+        p.cpu_times->emit_ms +=
+            std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+    if (stopped) {
         out.ended_with_stop = true;
         ++out.n_generated;
         stop = true;
         log_output("[xllama] stop sequence after " + std::to_string(out.n_generated) + " tokens\n");
         return false;
     }
-    if (!decode_one(p.ctx, token)) {
+    const auto t1 = p.cpu_times ? clock::now() : clock::time_point{};
+    const bool decoded = decode_one(p.ctx, token);
+    if (p.cpu_times) {
+        p.cpu_times->llama_decode_ms +=
+            std::chrono::duration<double, std::milli>(clock::now() - t1).count();
+        ++p.cpu_times->tokens;
+    }
+    if (!decoded) {
         log_output("[xllama] decode failed at token, stopping generation\n");
         decode_ok = false;
         return false;
@@ -308,8 +326,14 @@ inline DecodeLoopResult decode_loop(const DecodeLoopParams& p, std::string& outp
         if (p.watchdog && p.watchdog->aborted())
             break;
 
+        const auto ts = p.cpu_times ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
         llama_token token =
             p.grammar ? detail::sample_with_grammar(p) : llama_sampler_sample(p.sampler, p.ctx, -1);
+        if (p.cpu_times)
+            p.cpu_times->sample_ms +=
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts)
+                    .count();
         if (detail::stops_at_eog(p, token)) {
             log_output("[xllama] EOG after " + std::to_string(out.n_generated) + " tokens\n");
             break;

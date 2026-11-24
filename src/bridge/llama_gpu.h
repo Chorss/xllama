@@ -168,13 +168,20 @@ class GgufCpuThreadpools {
         reset();
     }
 
-    void attach(int applied_layers, llama_context* ctx, int n_threads, int n_threads_batch) {
+    // |n_threads| sizes the decode (1-token) pool, |n_threads_batch| the
+    // prefill pool. |decode_poll| >= 0 overrides the decode pool's polling
+    // level (decode_poll.txt, cpu_tuning.h) and forces a separate prefill
+    // pool so prefill keeps ggml's default.
+    void attach(int applied_layers, llama_context* ctx, int n_threads, int n_threads_batch,
+                int decode_poll = -1) {
         if (applied_layers <= 0 || !ctx || n_threads <= 0)
             return;
         if (!tp_) {
             ggml_threadpool_params p = ggml_threadpool_params_default(n_threads);
+            if (decode_poll >= 0)
+                p.poll = static_cast<uint32_t>(decode_poll);
             tp_ = ggml_threadpool_new(&p);
-            if (n_threads_batch > 0 && n_threads_batch != n_threads) {
+            if (n_threads_batch > 0 && (n_threads_batch != n_threads || decode_poll >= 0)) {
                 ggml_threadpool_params pb = ggml_threadpool_params_default(n_threads_batch);
                 tp_batch_ = ggml_threadpool_new(&pb);
             }

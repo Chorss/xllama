@@ -5,6 +5,7 @@
 
 #include "xllama/benchmark_identity.h"
 #include "xllama/chat_prompt.h"
+#include "xllama/cpu_tuning.h"
 #include "xllama/device_train.h"
 #include "xllama/diskbw.h"
 #include "xllama/gpubw.h"
@@ -343,6 +344,19 @@ void main_loop() {
         host_len += snprintf(host_buf + host_len, sizeof(host_buf) - host_len, "-noeog");
     if (bench_greedy)
         host_len += snprintf(host_buf + host_len, sizeof(host_buf) - host_len, "-greedy");
+    if (bench_gpu_layers > 0) {
+        // cpu_tuning.h knobs change decode while the n_threads column keeps
+        // the prefill count; tag them so a row cannot pass for a baseline.
+        const ::xllama::CpuDecodeTuning ct = ::xllama::read_cpu_decode_tuning();
+        if (ct.decode_threads > 0)
+            host_len += snprintf(host_buf + host_len, sizeof(host_buf) - host_len, "-dt%d",
+                                 ct.decode_threads);
+        if (ct.decode_poll >= 0)
+            host_len += snprintf(host_buf + host_len, sizeof(host_buf) - host_len, "-poll%d",
+                                 ct.decode_poll);
+        if (ct.relax_pause)
+            host_len += snprintf(host_buf + host_len, sizeof(host_buf) - host_len, "-pause");
+    }
     if (bench_prompt_lookup != 0)
         snprintf(host_buf + host_len, sizeof(host_buf) - host_len, "-plookup");
 
