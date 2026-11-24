@@ -396,6 +396,266 @@ std::int32_t cvt_i32(float r) {
 
 } // namespace
 
+namespace {
+
+// 96-bit unsigned integers in three 32-bit words (w[0] lowest): the shader has
+// no 64-bit integers to rely on, so the host twin uses none either.
+struct U96 {
+    std::uint32_t w[3] = {0, 0, 0};
+};
+
+U96 u96(std::uint32_t lo) {
+    U96 r;
+    r.w[0] = lo;
+    return r;
+}
+
+bool is_zero96(const U96& a) {
+    return (a.w[0] | a.w[1] | a.w[2]) == 0;
+}
+
+U96 add96(const U96& a, const U96& b) {
+    U96 r;
+    std::uint32_t carry = 0;
+    for (int i = 0; i < 3; ++i) {
+        const std::uint32_t s = a.w[i] + b.w[i];
+        const std::uint32_t c1 = s < a.w[i] ? 1u : 0u;
+        const std::uint32_t s2 = s + carry;
+        const std::uint32_t c2 = s2 < s ? 1u : 0u;
+        r.w[i] = s2;
+        carry = c1 | c2;
+    }
+    return r;
+}
+
+U96 sub96(const U96& a, const U96& b) { // a >= b
+    U96 r;
+    std::uint32_t borrow = 0;
+    for (int i = 0; i < 3; ++i) {
+        const std::uint32_t d = a.w[i] - b.w[i];
+        const std::uint32_t b1 = a.w[i] < b.w[i] ? 1u : 0u;
+        const std::uint32_t d2 = d - borrow;
+        const std::uint32_t b2 = d < borrow ? 1u : 0u;
+        r.w[i] = d2;
+        borrow = b1 | b2;
+    }
+    return r;
+}
+
+bool ge96(const U96& a, const U96& b) {
+    for (int i = 2; i >= 0; --i)
+        if (a.w[i] != b.w[i])
+            return a.w[i] > b.w[i];
+    return true;
+}
+
+U96 shl96(const U96& a, int s) { // 0 <= s < 96
+    U96 r;
+    const int ws = s / 32, bs = s % 32;
+    for (int i = 2; i >= 0; --i) {
+        const int j = i - ws;
+        std::uint32_t v = 0;
+        if (j >= 0) {
+            v = a.w[j] << bs;
+            if (bs != 0 && j >= 1)
+                v |= a.w[j - 1] >> (32 - bs);
+        }
+        r.w[i] = v;
+    }
+    return r;
+}
+
+// a >> s; *sticky |= any bit shifted out. s >= 0, any size.
+U96 shr96(const U96& a, int s, std::uint32_t* sticky) {
+    if (s >= 96) {
+        *sticky |= is_zero96(a) ? 0u : 1u;
+        return U96{};
+    }
+    const int ws = s / 32, bs = s % 32;
+    std::uint32_t lost = 0;
+    for (int i = 0; i < ws; ++i)
+        lost |= a.w[i];
+    if (bs != 0)
+        lost |= a.w[ws] & ((1u << bs) - 1u);
+    U96 r;
+    for (int i = 0; i < 3; ++i) {
+        const int j = i + ws;
+        std::uint32_t v = 0;
+        if (j <= 2) {
+            v = a.w[j] >> bs;
+            if (bs != 0 && j + 1 <= 2)
+                v |= a.w[j + 1] << (32 - bs);
+        }
+        r.w[i] = v;
+    }
+    *sticky |= lost != 0 ? 1u : 0u;
+    return r;
+}
+
+int top96(const U96& a) { // highest set bit, -1 for zero
+    for (int i = 2; i >= 0; --i)
+        if (a.w[i] != 0) {
+            int b = 31;
+            while ((a.w[i] >> b) == 0)
+                --b;
+            return i * 32 + b;
+        }
+    return -1;
+}
+
+} // namespace
+
+std::uint32_t d3d12_f32_fma_rn(std::uint32_t a, std::uint32_t b, std::uint32_t c) {
+    const std::uint32_t sp = (a ^ b) & 0x80000000u, sc = c & 0x80000000u;
+    const std::uint32_t ea = (a >> 23) & 0xffu, eb = (b >> 23) & 0xffu, ec = (c >> 23) & 0xffu;
+    std::uint32_t ma = a & 0x7fffffu, mb = b & 0x7fffffu, mc = c & 0x7fffffu;
+    const bool a_nan = ea == 0xffu && ma != 0, b_nan = eb == 0xffu && mb != 0,
+               c_nan = ec == 0xffu && mc != 0;
+    const bool a_inf = ea == 0xffu && ma == 0, b_inf = eb == 0xffu && mb == 0,
+               c_inf = ec == 0xffu && mc == 0;
+    const bool a_zero = ea == 0 && ma == 0, b_zero = eb == 0 && mb == 0,
+               c_zero = ec == 0 && mc == 0;
+    if (a_nan || b_nan || c_nan)
+        return 0x7fc00000u;
+    if (a_inf || b_inf) {
+        if (a_zero || b_zero || (c_inf && sc != sp))
+            return 0x7fc00000u;
+        return sp | 0x7f800000u;
+    }
+    if (c_inf)
+        return c;
+    if (a_zero || b_zero) {
+        if (c_zero)
+            return sp & sc; // -0 only when both are -0 (round to nearest)
+        return c;
+    }
+    // value = m * 2^x; subnormals keep their smaller m, top96 finds the top bit.
+    const int xa = (ea == 0 ? 1 : static_cast<int>(ea)) - 150;
+    const int xb = (eb == 0 ? 1 : static_cast<int>(eb)) - 150;
+    const int xc = (ec == 0 ? 1 : static_cast<int>(ec)) - 150;
+    if (ea != 0)
+        ma |= 0x800000u;
+    if (eb != 0)
+        mb |= 0x800000u;
+    if (ec != 0)
+        mc |= 0x800000u;
+    // Exact 48-bit product from 12-bit halves (each partial product < 2^24).
+    const std::uint32_t al = ma & 0xfffu, ah = ma >> 12, bl = mb & 0xfffu, bh = mb >> 12;
+    U96 prod =
+        add96(add96(shl96(u96(ah * bh), 24), shl96(u96(ah * bl + al * bh), 12)), u96(al * bl));
+    const int xp = xa + xb;
+    U96 cm = u96(mc);
+    // One window for both: LSB exponent L, top bit at most 93 (room for a carry).
+    const int tp = xp + top96(prod);
+    const int tc = c_zero ? tp : xc + top96(cm);
+    const int hi = std::max(tp, tc);
+    int lsb = c_zero ? xp : std::min(xp, xc);
+    if (hi - lsb > 93)
+        lsb = hi - 93;
+    std::uint32_t st_p = 0, st_c = 0;
+    prod = xp >= lsb ? shl96(prod, xp - lsb) : shr96(prod, lsb - xp, &st_p);
+    cm = c_zero ? U96{} : (xc >= lsb ? shl96(cm, xc - lsb) : shr96(cm, lsb - xc, &st_c));
+    // Bits below the window are jammed into the LSB: they then only decide the
+    // rounding, which sits at least 40 bits higher whenever anything was lost.
+    prod.w[0] |= st_p;
+    cm.w[0] |= st_c;
+    U96 sum;
+    std::uint32_t sign;
+    if (sp == sc) {
+        sum = add96(prod, cm);
+        sign = sp;
+    } else if (ge96(prod, cm)) {
+        sum = sub96(prod, cm);
+        sign = sp;
+    } else {
+        sum = sub96(cm, prod);
+        sign = sc;
+    }
+    if (is_zero96(sum))
+        return 0; // exact cancellation: +0 when rounding to nearest
+    const int t = top96(sum);
+    const int e = lsb + t; // exponent of the top bit
+    if (e > 127)
+        return sign | 0x7f800000u;
+    const int out_lsb = e <= -126 ? -149 : e - 23;
+    const int sh = out_lsb - lsb;
+    std::uint32_t mant, round = 0, sticky = 0;
+    if (sh <= 0) {
+        mant = shl96(sum, -sh).w[0];
+    } else {
+        const U96 r = shr96(sum, sh - 1, &sticky);
+        round = r.w[0] & 1u;
+        mant = r.w[0] >> 1;
+    }
+    if (round != 0 && (sticky != 0 || (mant & 1u) != 0))
+        ++mant;
+    // At e == -126 the implicit bit (2^23) is exponent field 1, so both forms
+    // agree there; a rounding carry moves into the exponent on its own.
+    const std::uint32_t bits =
+        e <= -126 ? mant : (static_cast<std::uint32_t>(e + 126) << 23) + mant;
+    return sign | std::min(bits, 0x7f800000u);
+}
+
+namespace {
+
+std::uint32_t fbits(float f) {
+    std::uint32_t u;
+    std::memcpy(&u, &f, sizeof(u));
+    return u;
+}
+
+float fval(std::uint32_t u) {
+    float f;
+    std::memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+float fmadd(float a, float b, float c) {
+    return fval(d3d12_f32_fma_rn(fbits(a), fbits(b), fbits(c)));
+}
+
+// ggml_v_expf, AVX2 + FMA, one lane. Every lane takes the same branch result
+// whatever its neighbours do: the slow path blends per lane, and its !c lanes
+// compute fma(k, j, k) == fma(j, k, k).
+float v_expf_lane(float x) {
+    const float r = 0x1.8p23f;
+    const float z = fmadd(x, 0x1.715476p+0f, r);
+    const float n = z - r;
+    const float b = fmadd(-n, 0x1.7f7d1cp-20f, fmadd(-n, 0x1.62e4p-1f, x));
+    const std::uint32_t e = fbits(z) << 23;
+    const float k = fval(e + fbits(1.0f));
+    const bool c = std::fabs(n) > 126.0f;
+    const float u = b * b;
+    const float j = fmadd(fmadd(fmadd(0x1.0e4020p-7f, b, 0x1.573e2ep-5f), u,
+                                fmadd(0x1.555e66p-3f, b, 0x1.fffdb6p-2f)),
+                          u, 0x1.ffffecp-1f * b);
+    if (!c)
+        return fmadd(j, k, k);
+    const std::uint32_t g = n <= 0.0f ? 0x82000000u : 0u;
+    const float s1 = fval(g + 0x7f000000u);
+    const float s2 = fval(e - g);
+    if (std::fabs(n) > 192.0f)
+        return s1 * s1;
+    return fmadd(s2, j, s2) * s1;
+}
+
+} // namespace
+
+float d3d12_swiglu_emulate(float x, float g) {
+    const float neg_x = 0.0f - x;
+    const float den = 1.0f + v_expf_lane(neg_x);
+    const float silu = fval(d3d12_f32_div_rn(fbits(x), fbits(den)));
+    return silu * g;
+}
+
+bool d3d12_swiglu_supported(const D3d12SwigluDesc& d) {
+    return d.glu_op_swiglu && d.two_sources && !d.swapped && d.src0_type == GGML_TYPE_F32 &&
+           d.src1_type == GGML_TYPE_F32 && d.dst_type == GGML_TYPE_F32 && d.rows_contiguous &&
+           d.same_shapes && d.ne0 > 0 && d.ne0 % 8 == 0 && d.ne1 >= 0 && d.ne2 == 1 && d.ne3 == 1 &&
+           (d.ne0 + kD3d12SwigluThreads - 1) / kD3d12SwigluThreads <= kD3d12MaxGroups &&
+           d.ne1 <= kD3d12MaxGroups;
+}
+
 void d3d12_quantize_q8_0_emulate(const float* x, int k, std::uint8_t* out) {
     for (int b = 0; b < k / 32; ++b, x += 32, out += 34) {
         std::uint32_t amax = 0; // max |x| on bits: same order as floats, no FTZ
@@ -833,6 +1093,7 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         #include "ggml_d3d12_quantize_q8_0_dxil.h"
         #include "ggml_d3d12_quantize_q8_k_dxil.h"
         #include "ggml_d3d12_rope_f32_dxil.h"
+        #include "ggml_d3d12_swiglu_f32_dxil.h"
         #include "xllama/d3d12_dyn.h"
         #include "xllama/path_utils.h"
         #include "xllama/platform.h"
@@ -877,6 +1138,9 @@ struct Gpu {
     // quantizes it on the GPU instead of ending the submission.
     ComPtr<ID3D12PipelineState> pso_quant[2]; // [0 = q8_0, 1 = q8_K]
     bool gpu_quant = false;
+    // d3d12-swiglu.txt = 1: SWIGLU (separate gate and up) runs here.
+    ComPtr<ID3D12PipelineState> pso_swiglu;
+    bool swiglu = false;
     ComPtr<ID3D12QueryHeap> ts;
     ComPtr<ID3D12Resource> ts_rb;
     // #421 per-dispatch timing (d3d12-dispatch-timing.txt): one timestamp
@@ -916,8 +1180,9 @@ struct Gpu {
 // round trips at load only.
 constexpr UINT64 kStagingBytes = 8ull << 20;
 
-// `with_rope` adds u2 (the ROPE cos/sin table). Without the knob the signature
-// is the four-parameter one every other kernel was built against.
+// `with_rope` adds u2 (the ROPE cos/sin table, SWIGLU's up input). Without the
+// ROPE or SWIGLU knob the signature is the four-parameter one every other
+// kernel was built against.
 ComPtr<ID3D12RootSignature> make_root_sig(ID3D12Device* device, bool with_rope, std::string* err) {
     D3D12_ROOT_PARAMETER p[5] = {};
     p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -994,12 +1259,19 @@ bool init_gpu(Gpu& g) {
         std::fclose(f);
         g.rope = d3d12_flag_enabled(std::string_view(config, bytes));
     }
-    g.root = make_root_sig(g.device.Get(), g.rope, &err);
-    if (!g.root && g.rope) {
+    if (FILE* f = _wfopen(utf8_to_wstring(resolve_local_path("d3d12-swiglu.txt")).c_str(), L"rb")) {
+        char config[16] = {};
+        const std::size_t bytes = std::fread(config, 1, sizeof(config), f);
+        std::fclose(f);
+        g.swiglu = d3d12_flag_enabled(std::string_view(config, bytes));
+    }
+    g.root = make_root_sig(g.device.Get(), g.rope || g.swiglu, &err);
+    if (!g.root && (g.rope || g.swiglu)) {
         // The opt-in must not take the backend down: fall back to the
         // four-parameter signature every other kernel was built against.
-        log_output("[xllama] d3d12: ROPE unavailable: " + err + "\n");
+        log_output("[xllama] d3d12: ROPE/SWIGLU unavailable: " + err + "\n");
         g.rope = false;
+        g.swiglu = false;
         err.clear();
         g.root = make_root_sig(g.device.Get(), false, &err);
     }
@@ -1093,6 +1365,19 @@ bool init_gpu(Gpu& g) {
         }
     }
     log_output(std::string("[xllama] d3d12: gpu_quant=") + (g.gpu_quant ? "1" : "0") + "\n");
+    if (g.swiglu) { // knob read before the root signature, which it shapes
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+        pd.pRootSignature = g.root.Get();
+        pd.CS.pShaderBytecode = kGgmlD3d12SwigluF32Dxil;
+        pd.CS.BytecodeLength = kGgmlD3d12SwigluF32DxilSize;
+        hr = g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_swiglu));
+        if (FAILED(hr)) {
+            log_output("[xllama] d3d12: SWIGLU unavailable: " +
+                       d3d12c::hr_message("CreateComputePipelineState", hr) + "\n");
+            g.swiglu = false;
+        }
+    }
+    log_output(std::string("[xllama] d3d12: swiglu=") + (g.swiglu ? "1" : "0") + "\n");
     if (SUCCEEDED(g.queue->GetTimestampFrequency(&g.ts_freq)) && g.ts_freq > 0) {
         D3D12_QUERY_HEAP_DESC qhd = {};
         qhd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
@@ -1462,6 +1747,9 @@ struct Op {
     // GPU quantize (d3d12-gpu-quant.txt): node is the matmul it feeds, `src`
     // its F32 input; the q8 output goes to g.xq at xq_off, xq_row per column.
     const ggml_tensor* src = nullptr;
+    // SWIGLU: the up input, staged in g.xq at up_off when up_staged.
+    bool up_staged = false;
+    std::size_t up_off = 0;
 };
 
 // Room for `count` per-dispatch timestamps. Caller holds g.mu, nothing in flight.
@@ -1503,6 +1791,8 @@ const char* dispatch_op_name(const ggml_tensor* node) {
         return "add";
     case GGML_OP_ROPE:
         return "rope";
+    case GGML_OP_GLU:
+        return "swiglu";
     default:
         return "mul_mat";
     }
@@ -1526,6 +1816,9 @@ D3d12DispatchKind dispatch_kind(const ggml_tensor* node) {
     } else if (node->op == GGML_OP_ROPE) {
         k.op = "rope";
         k.threads = kD3d12RopeThreads;
+    } else if (node->op == GGML_OP_GLU) {
+        k.op = "swiglu";
+        k.threads = kD3d12SwigluThreads;
     } else if (node->op == GGML_OP_GET_ROWS) {
         k.op = "get_rows";
     } else {
@@ -1603,9 +1896,11 @@ bool submit_ops(Gpu& g, const std::vector<Op>& ops) {
                 const bool is_quant = op.src != nullptr;
                 const bool is_rope = !is_quant && node->op == GGML_OP_ROPE;
                 const bool is_add = !is_quant && node->op == GGML_OP_ADD;
+                const bool is_glu = !is_quant && node->op == GGML_OP_GLU;
                 // A quantize reads a tensor an earlier dispatch wrote and its
                 // matmul reads the quantize's output: barriers on both sides.
-                const bool fenced = is_add || is_rope || is_quant;
+                // SWIGLU reads gate and up from the matmuls before it.
+                const bool fenced = is_add || is_rope || is_quant || is_glu;
                 if (prev && !dt && (fenced || prev_add))
                     cl->ResourceBarrier(1, &uav);
                 prev = true;
@@ -1630,6 +1925,33 @@ bool submit_ops(Gpu& g, const std::vector<Op>& ops) {
                     cl->Dispatch(
                         static_cast<UINT>((units + kD3d12QuantThreads - 1) / kD3d12QuantThreads),
                         static_cast<UINT>(x->ne[1]), 1);
+                    after_dispatch();
+                    continue;
+                }
+                if (is_glu) {
+                    const ggml_tensor* ga = node->src[0];
+                    const ggml_tensor* up = node->src[1];
+                    const std::uint32_t c[8] = {
+                        static_cast<std::uint32_t>(node->ne[0]),
+                        static_cast<std::uint32_t>(op.staged ? node->ne[0]
+                                                             : ga->nb[1] / sizeof(float)),
+                        static_cast<std::uint32_t>(op.up_staged ? node->ne[0]
+                                                                : up->nb[1] / sizeof(float)),
+                        static_cast<std::uint32_t>(node->nb[1] / sizeof(float)),
+                        0,
+                        0,
+                        0,
+                        0};
+                    cl->SetPipelineState(g.pso_swiglu.Get());
+                    cl->SetComputeRoot32BitConstants(0, 8, c, 0);
+                    cl->SetComputeRootUnorderedAccessView(2, tensor_va(node));
+                    cl->SetComputeRootUnorderedAccessView(3, op.staged ? xq_va + op.xq_off
+                                                                       : tensor_va(ga));
+                    cl->SetComputeRootUnorderedAccessView(4, op.up_staged ? xq_va + op.up_off
+                                                                          : tensor_va(up));
+                    cl->Dispatch(static_cast<UINT>((node->ne[0] + kD3d12SwigluThreads - 1) /
+                                                   kD3d12SwigluThreads),
+                                 static_cast<UINT>(node->ne[1]), 1);
                     after_dispatch();
                     continue;
                 }
@@ -1778,12 +2100,12 @@ bool submit_ops(Gpu& g, const std::vector<Op>& ops) {
                 }
                 const double ms =
                     1000.0 * static_cast<double>(t[i + 1] - t[i]) / static_cast<double>(g.ts_freq);
-                const double bytes = op.src ? static_cast<double>(ggml_nbytes(op.src))
-                                     : node->op == GGML_OP_ADD || node->op == GGML_OP_ROPE
-                                         ? static_cast<double>(ggml_nbytes(w))
-                                     : node->op == GGML_OP_GET_ROWS
-                                         ? static_cast<double>(w->nb[1]) * node->ne[1]
-                                         : static_cast<double>(w->nb[1]) * w->ne[1];
+                const double bytes =
+                    op.src ? static_cast<double>(ggml_nbytes(op.src))
+                    : node->op == GGML_OP_ADD || node->op == GGML_OP_ROPE || node->op == GGML_OP_GLU
+                        ? static_cast<double>(ggml_nbytes(w))
+                    : node->op == GGML_OP_GET_ROWS ? static_cast<double>(w->nb[1]) * node->ne[1]
+                                                   : static_cast<double>(w->nb[1]) * w->ne[1];
                 g.phase.dispatch.add(op_kind(op), ms, bytes, dispatch_columns(node));
                 g.phase.layer.add(key, ms, wait_share);
             }
@@ -1813,6 +2135,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         case GGML_OP_GET_ROWS:
         case GGML_OP_ADD:
         case GGML_OP_ROPE:
+        case GGML_OP_GLU:
             mm.push_back(node);
             break;
         case GGML_OP_NONE:
@@ -1944,6 +2267,45 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                 used += (tab_bytes + 255) & ~std::size_t(255);
             }
             o.tab_off = tab->off;
+            ops.push_back(o);
+            note_produced(node);
+            continue;
+        }
+        if (node->op == GGML_OP_GLU) {
+            GGML_ASSERT(node->buffer && is_ours(node->buffer->buft));
+            if (ggml_nelements(node) == 0)
+                continue;
+            // Gate and up are read in place from D3D12_Host; anything in another
+            // host buffer is computed already (this batch only writes ours) and
+            // gets a dense copy in g.xq.
+            Op o{node, 0, 0, false};
+            std::size_t need = 0;
+            const auto dense = [](const ggml_tensor* t) {
+                return static_cast<std::size_t>(t->ne[0]) * sizeof(float) *
+                       static_cast<std::size_t>(t->ne[1]);
+            };
+            for (int i = 0; i < 2; ++i) {
+                const ggml_tensor* t = node->src[i];
+                GGML_ASSERT(t->buffer && ggml_backend_buffer_is_host(t->buffer));
+                if (!is_ours(t->buffer->buft))
+                    need += (dense(t) + 255) & ~std::size_t(255);
+            }
+            if (used + need > g.xq_bytes && !flush())
+                return GGML_STATUS_FAILED;
+            if (!ensure_xq(g, used + need))
+                return GGML_STATUS_FAILED;
+            for (int i = 0; i < 2; ++i) {
+                const ggml_tensor* t = node->src[i];
+                if (is_ours(t->buffer->buft))
+                    continue;
+                const std::size_t row = static_cast<std::size_t>(t->ne[0]) * sizeof(float);
+                for (std::int64_t c = 0; c < t->ne[1]; ++c)
+                    std::memcpy(g.xq_ptr + used + c * row,
+                                static_cast<const std::uint8_t*>(t->data) + c * t->nb[1], row);
+                (i == 0 ? o.staged : o.up_staged) = true;
+                (i == 0 ? o.xq_off : o.up_off) = used;
+                used += (dense(t) + 255) & ~std::size_t(255);
+            }
             ops.push_back(o);
             note_produced(node);
             continue;
@@ -2242,6 +2604,36 @@ bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
         d.n_offs = op->op_params[15];
         std::memcpy(&d.ext_factor, op->op_params + 7, sizeof(float));
         return d3d12_rope_supported(d);
+    }
+    case GGML_OP_GLU: {
+        if (!gpu().swiglu)
+            return false;
+        const ggml_tensor* a = op->src[0];
+        const ggml_tensor* b = op->src[1];
+        D3d12SwigluDesc d;
+        d.two_sources = b != nullptr;
+        if (!d.two_sources)
+            return false;
+        d.src0_type = a->type;
+        d.src1_type = b->type;
+        d.dst_type = op->type;
+        d.ne0 = op->ne[0];
+        d.ne1 = op->ne[1];
+        d.ne2 = op->ne[2];
+        d.ne3 = op->ne[3];
+        d.glu_op_swiglu = ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU;
+        d.swapped = op->op_params[1] != 0;
+        d.rows_contiguous =
+            a->nb[0] == sizeof(float) && b->nb[0] == sizeof(float) && op->nb[0] == sizeof(float);
+        d.same_shapes = ggml_are_same_shape(a, op) && ggml_are_same_shape(b, op);
+        // Inputs the GPU reads must be host-visible (D3D12_Host or another CPU
+        // buffer), never weights; activations without a buffer yet are the
+        // scheduler's (D3D12_Host).
+        for (const ggml_tensor* t : {a, b})
+            if (t->buffer &&
+                (t->buffer->buft == &kWeightsBuft || !ggml_backend_buffer_is_host(t->buffer)))
+                return false;
+        return d3d12_swiglu_supported(d);
     }
     case GGML_OP_ADD: {
         if (!gpu().bias_add)
@@ -2910,6 +3302,229 @@ D3d12SelftestRow run_quant_chain_case(ggml_backend_t backend, ggml_type wt, int 
     return row;
 }
 
+// SWIGLU (d3d12-swiglu.txt) against ggml-cpu's own SWIGLU on the same inputs:
+// the kernel reproduces the AVX2 + FMA vector path, so the output must be bit
+// identical. `staged` puts gate and up in a plain CPU buffer (copied into xq).
+// n = elements per column, ncols = columns. Inputs span the exp slow path.
+D3d12SelftestRow run_swiglu_case(ggml_backend_t backend, bool staged, int n, int ncols) {
+    D3d12SelftestRow row;
+    row.type = staged ? "swiglu_staged" : "swiglu";
+    row.n = n;
+    row.ncols = ncols;
+    const std::size_t count = static_cast<std::size_t>(n) * ncols;
+    ggml_init_params ip = {};
+    ip.mem_size = 8 * ggml_tensor_overhead() + ggml_graph_overhead();
+    ip.no_alloc = true;
+    ggml_context* ctx_x = ggml_init(ip);
+    ggml_context* ctx_g = ggml_init(ip);
+    ggml_backend_buffer_t xbuf = nullptr;
+    ggml_gallocr_t galloc = nullptr;
+    auto cleanup = [&] {
+        if (galloc)
+            ggml_gallocr_free(galloc);
+        if (xbuf)
+            ggml_backend_buffer_free(xbuf);
+        ggml_free(ctx_g);
+        ggml_free(ctx_x);
+    };
+    if (!ctx_x || !ctx_g) {
+        row.error = "context allocation failed";
+        cleanup();
+        return row;
+    }
+    ggml_tensor* ga = ggml_new_tensor_2d(ctx_x, GGML_TYPE_F32, n, ncols);
+    ggml_tensor* up = ggml_new_tensor_2d(ctx_x, GGML_TYPE_F32, n, ncols);
+    xbuf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_x, staged ? ggml_backend_cpu_buffer_type()
+                                                                  : &kHostBuft);
+    if (!xbuf) {
+        row.error = "buffer allocation failed";
+        cleanup();
+        return row;
+    }
+    std::mt19937 rng(99u + static_cast<unsigned>(n + ncols));
+    std::normal_distribution<float> nd(0.0f, 3.0f);
+    std::uniform_real_distribution<float> wide(-250.0f, 250.0f);
+    std::vector<float> gv(count), uv(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        gv[i] = i % 5 == 0 ? wide(rng) : nd(rng);
+        uv[i] = nd(rng);
+    }
+    ggml_backend_tensor_set(ga, gv.data(), 0, count * sizeof(float));
+    ggml_backend_tensor_set(up, uv.data(), 0, count * sizeof(float));
+    ggml_tensor* y = ggml_swiglu_split(ctx_g, ga, up);
+    ggml_cgraph* gf = ggml_new_graph(ctx_g);
+    ggml_build_forward_expand(gf, y);
+    galloc = ggml_gallocr_new(&kHostBuft);
+    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+        row.error = "graph allocation failed";
+        cleanup();
+        return row;
+    }
+    row.d3d12_ran = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+    if (!row.d3d12_ran) {
+        row.error = "graph_compute failed";
+        cleanup();
+        return row;
+    }
+    row.gpu_ms = gpu().last_gpu_ms;
+    std::vector<float> got(count);
+    ggml_backend_tensor_get(y, got.data(), 0, count * sizeof(float));
+
+    ggml_init_params rp = {};
+    rp.mem_size = count * sizeof(float) * 3 + (4u << 20);
+    ggml_context* rc = ggml_init(rp);
+    if (!rc) {
+        row.error = "reference context allocation failed";
+        cleanup();
+        return row;
+    }
+    ggml_tensor* ra = ggml_new_tensor_2d(rc, GGML_TYPE_F32, n, ncols);
+    ggml_tensor* rb = ggml_new_tensor_2d(rc, GGML_TYPE_F32, n, ncols);
+    std::memcpy(ra->data, gv.data(), count * sizeof(float));
+    std::memcpy(rb->data, uv.data(), count * sizeof(float));
+    ggml_tensor* ry = ggml_swiglu_split(rc, ra, rb);
+    ggml_cgraph* rg = ggml_new_graph(rc);
+    ggml_build_forward_expand(rg, ry);
+    const bool ref_ok = ggml_graph_compute_with_ctx(rc, rg, 1) == GGML_STATUS_SUCCESS;
+    std::size_t diff = 0;
+    double max_diff = 0.0, max_ref = 0.0;
+    if (ref_ok) {
+        const auto* ref = static_cast<const float*>(ry->data);
+        for (std::size_t i = 0; i < count; ++i) {
+            if (std::memcmp(&got[i], &ref[i], sizeof(float)) != 0)
+                ++diff;
+            max_diff = std::max(max_diff, std::fabs(static_cast<double>(got[i]) - ref[i]));
+            max_ref = std::max(max_ref, std::fabs(static_cast<double>(ref[i])));
+        }
+    }
+    ggml_free(rc);
+    row.rel_err = max_ref > 0.0 ? max_diff / max_ref : max_diff;
+    row.ok = ref_ok && diff == 0;
+    char note[64];
+    std::snprintf(note, sizeof(note), "mismatched=%zu", diff);
+    row.error = !ref_ok ? "cpu reference failed" : note;
+    cleanup();
+    return row;
+}
+
+// The FFN as llama.cpp builds it: gate and up projections, SWIGLU, down. With
+// SWIGLU and the GPU quantize on, it is one submission; the knob-off run of the
+// quantize (down's input quantized on the CPU, two submissions) must give the
+// same bits.
+D3d12SelftestRow run_ffn_chain_case(ggml_backend_t backend, ggml_type wt, int embd, int ff,
+                                    int ncols) {
+    D3d12SelftestRow row;
+    row.type = std::string("ffn_") + ggml_type_name(wt);
+    row.n = embd;
+    row.k = ff;
+    row.ncols = ncols;
+    ggml_init_params ip = {};
+    ip.mem_size = 16 * ggml_tensor_overhead() + ggml_graph_overhead();
+    ip.no_alloc = true;
+    ggml_context* ctx_w = ggml_init(ip);
+    ggml_context* ctx_x = ggml_init(ip);
+    ggml_context* ctx_g = ggml_init(ip);
+    ggml_backend_buffer_t wbuf = nullptr, xbuf = nullptr;
+    ggml_gallocr_t galloc = nullptr;
+    auto cleanup = [&] {
+        if (galloc)
+            ggml_gallocr_free(galloc);
+        if (wbuf)
+            ggml_backend_buffer_free(wbuf);
+        if (xbuf)
+            ggml_backend_buffer_free(xbuf);
+        ggml_free(ctx_g);
+        ggml_free(ctx_x);
+        ggml_free(ctx_w);
+    };
+    if (!ctx_w || !ctx_x || !ctx_g) {
+        row.error = "context allocation failed";
+        cleanup();
+        return row;
+    }
+    ggml_tensor* wg = ggml_new_tensor_2d(ctx_w, wt, embd, ff);
+    ggml_tensor* wu = ggml_new_tensor_2d(ctx_w, wt, embd, ff);
+    ggml_tensor* wd = ggml_new_tensor_2d(ctx_w, wt, ff, embd);
+    ggml_tensor* x = ggml_new_tensor_2d(ctx_x, GGML_TYPE_F32, embd, ncols);
+    wbuf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, &kWeightsBuft);
+    xbuf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_x, &kHostBuft);
+    if (!wbuf || !xbuf) {
+        row.error = "buffer allocation failed";
+        cleanup();
+        return row;
+    }
+    std::mt19937 rng(555u + static_cast<unsigned>(embd + ff + ncols));
+    std::uniform_real_distribution<float> uni(-1.f, 1.f);
+    for (ggml_tensor* w : {wg, wu, wd}) {
+        std::vector<float> wf(static_cast<std::size_t>(ggml_nelements(w)));
+        for (float& v : wf)
+            v = uni(rng) * 0.1f;
+        std::vector<std::uint8_t> q(ggml_nbytes(w));
+        ggml_quantize_chunk(wt, wf.data(), q.data(), 0, w->ne[1], w->ne[0], nullptr);
+        ggml_backend_tensor_set(w, q.data(), 0, q.size());
+    }
+    std::vector<float> xf(static_cast<std::size_t>(embd) * ncols);
+    for (float& v : xf)
+        v = uni(rng);
+    ggml_backend_tensor_set(x, xf.data(), 0, xf.size() * sizeof(float));
+    ggml_tensor* y = ggml_mul_mat(
+        ctx_g, wd,
+        ggml_swiglu_split(ctx_g, ggml_mul_mat(ctx_g, wg, x), ggml_mul_mat(ctx_g, wu, x)));
+    ggml_cgraph* gf = ggml_new_graph(ctx_g);
+    ggml_build_forward_expand(gf, y);
+    galloc = ggml_gallocr_new(&kHostBuft);
+    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+        row.error = "graph allocation failed";
+        cleanup();
+        return row;
+    }
+    const std::size_t count = static_cast<std::size_t>(embd) * ncols;
+    const auto run = [&](bool gpu_q, std::vector<float>* out_y, std::uint64_t* subs) {
+        Gpu& g = gpu();
+        {
+            std::lock_guard<std::mutex> lock(g.mu);
+            g.gpu_quant = gpu_q;
+        }
+        ggml_d3d12_take_stats(nullptr);
+        const bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+        D3d12PhaseStats st;
+        ggml_d3d12_take_stats(&st);
+        *subs = st.submissions;
+        out_y->resize(count);
+        if (ok)
+            ggml_backend_tensor_get(y, out_y->data(), 0, count * sizeof(float));
+        return ok;
+    };
+    std::vector<float> on, off;
+    std::uint64_t subs_on = 0, subs_off = 0;
+    const bool ran_on = run(true, &on, &subs_on);
+    row.gpu_ms = gpu().last_gpu_ms;
+    const bool ran_off = run(false, &off, &subs_off);
+    {
+        Gpu& g = gpu();
+        std::lock_guard<std::mutex> lock(g.mu);
+        g.gpu_quant = true; // only called with the knob on
+    }
+    row.d3d12_ran = ran_on && ran_off;
+    if (!row.d3d12_ran) {
+        row.error = "graph_compute failed";
+        cleanup();
+        return row;
+    }
+    bool finite = true;
+    for (std::size_t i = 0; i < count; ++i)
+        finite = finite && std::isfinite(on[i]) && std::isfinite(off[i]);
+    const bool identical = std::memcmp(on.data(), off.data(), count * sizeof(float)) == 0;
+    row.ok = finite && identical && subs_on == 1 && subs_off == 2;
+    char note[96];
+    std::snprintf(note, sizeof(note), "bit_identical=%d submissions_on=%llu submissions_off=%llu",
+                  identical ? 1 : 0, static_cast<unsigned long long>(subs_on),
+                  static_cast<unsigned long long>(subs_off));
+    row.error = !finite ? "non-finite output" : note;
+    cleanup();
+    return row;
+}
+
 } // namespace
 
 void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
@@ -2966,6 +3581,18 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         out->push_back(run_quant_chain_case(backend, GGML_TYPE_Q6_K, 2048, 2048, 7));
         out->push_back(run_quant_chain_case(backend, GGML_TYPE_Q4_0, 11008, 2048, 1));
         out->push_back(run_quant_chain_case(backend, GGML_TYPE_Q4_K, 11008, 2048, 1));
+    }
+    // SWIGLU (d3d12-swiglu.txt): Coder-3B's FFN width, decode and a ubatch, in
+    // place and staged; then whole FFN chains when the GPU quantize is on too.
+    if (gpu().swiglu) {
+        out->push_back(run_swiglu_case(backend, false, 11008, 1));
+        out->push_back(run_swiglu_case(backend, false, 11008, 7));
+        out->push_back(run_swiglu_case(backend, true, 8192, 3));
+        if (gpu().gpu_quant) {
+            out->push_back(run_ffn_chain_case(backend, GGML_TYPE_Q4_0, 2048, 8192, 1));
+            out->push_back(run_ffn_chain_case(backend, GGML_TYPE_Q4_K, 2048, 11008, 1));
+            out->push_back(run_ffn_chain_case(backend, GGML_TYPE_Q6_K, 2048, 8192, 7));
+        }
     }
     ggml_backend_free(backend);
 }

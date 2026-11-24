@@ -979,3 +979,133 @@ TEST_CASE("ggml_d3d12: GPU activation quantization equals ggml byte for byte") {
         check_quant_equal(at, z);
     }
 }
+
+TEST_CASE("ggml_d3d12: integer fp32 fma is correctly rounded") {
+    std::mt19937 rng(19);
+    std::uniform_int_distribution<std::uint32_t> any;
+    std::uniform_int_distribution<std::uint32_t> mant(0, 0x7fffffu);
+    std::uniform_int_distribution<std::uint32_t> exp_any(0, 254);
+    std::uniform_int_distribution<std::uint32_t> exp_mid(100, 154);
+    const auto check = [](std::uint32_t a, std::uint32_t b, std::uint32_t c) {
+        const float want = std::fmaf(from_bits(a), from_bits(b), from_bits(c));
+        const std::uint32_t got = d3d12_f32_fma_rn(a, b, c);
+        if (std::isnan(want)) {
+            CHECK(std::isnan(from_bits(got)));
+            return;
+        }
+        if (got != as_bits(want)) {
+            CAPTURE(a);
+            CAPTURE(b);
+            CAPTURE(c);
+            CHECK(got == as_bits(want));
+        }
+    };
+    const auto rnd = [&](bool mid) {
+        return (any(rng) & 0x80000000u) | ((mid ? exp_mid(rng) : exp_any(rng)) << 23) | mant(rng);
+    };
+    for (int i = 0; i < 300000; ++i)
+        check(rnd(false), rnd(false), rnd(false));
+    // Close exponents: cancellation and carries.
+    for (int i = 0; i < 300000; ++i)
+        check(rnd(true), rnd(true), rnd(true));
+    // c = -(a*b) rounded: massive cancellation, the exact remainder survives.
+    for (int i = 0; i < 100000; ++i) {
+        const std::uint32_t a = rnd(true), b = rnd(true);
+        check(a, b, as_bits(-(from_bits(a) * from_bits(b))));
+    }
+    // Subnormal products and sums.
+    for (int i = 0; i < 100000; ++i) {
+        const std::uint32_t a = (any(rng) & 0x80000000u) | ((any(rng) % 40u) << 23) | mant(rng);
+        const std::uint32_t b =
+            (any(rng) & 0x80000000u) | ((100u + any(rng) % 40u) << 23) | mant(rng);
+        const std::uint32_t c = (any(rng) & 0x80000000u) | ((any(rng) % 3u) << 23) | mant(rng);
+        check(a, b, c);
+    }
+    const std::uint32_t special[] = {
+        0u,          0x80000000u, 1u,          0x80000001u,   0x00800000u,    0x7f7fffffu,
+        0xff7fffffu, 0x7f800000u, 0xff800000u, as_bits(1.0f), as_bits(-1.0f), as_bits(0x1.8p23f)};
+    for (std::uint32_t a : special)
+        for (std::uint32_t b : special)
+            for (std::uint32_t c : special)
+                check(a, b, c);
+}
+
+TEST_CASE("ggml_d3d12: SWIGLU emulation equals ggml-cpu bit for bit") {
+    // x spans the fast path, |n| > 126 (slow path) and |n| > 192.
+    constexpr int n = 8 * 4096;
+    std::mt19937 rng(23);
+    std::normal_distribution<float> nd(0.0f, 3.0f);
+    std::uniform_real_distribution<float> wide(-250.0f, 250.0f);
+    std::vector<float> xs(n), gs(n);
+    for (int i = 0; i < n; ++i) {
+        xs[i] = i % 4 == 0 ? wide(rng) : nd(rng);
+        gs[i] = nd(rng);
+    }
+    const float edge[] = {0.0f,   -0.0f,   87.0f,   88.5f,  89.0f,
+                          -87.0f, -103.0f, -104.0f, 1e-40f, -1e-40f};
+    for (std::size_t i = 0; i < sizeof(edge) / sizeof(edge[0]); ++i)
+        xs[i] = edge[i];
+    ggml_init_params ip = {};
+    ip.mem_size = 4 * static_cast<std::size_t>(n) * sizeof(float) + (1u << 20);
+    ggml_context* ctx = ggml_init(ip);
+    REQUIRE(ctx);
+    ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8 * 512, n / (8 * 512));
+    ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8 * 512, n / (8 * 512));
+    std::memcpy(a->data, xs.data(), n * sizeof(float));
+    std::memcpy(b->data, gs.data(), n * sizeof(float));
+    ggml_tensor* y = ggml_swiglu_split(ctx, a, b);
+    ggml_cgraph* gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, y);
+    REQUIRE(ggml_graph_compute_with_ctx(ctx, gf, 1) == GGML_STATUS_SUCCESS);
+    const auto* want = static_cast<const float*>(y->data);
+    int mismatches = 0, first = -1;
+    for (int i = 0; i < n; ++i) {
+        const float got = d3d12_swiglu_emulate(xs[i], gs[i]);
+        if (std::memcmp(&got, &want[i], sizeof(float)) != 0) {
+            if (first < 0)
+                first = i;
+            ++mismatches;
+        }
+    }
+    CAPTURE(first);
+    if (first >= 0) {
+        CAPTURE(xs[first]);
+        CAPTURE(gs[first]);
+    }
+    CHECK(mismatches == 0);
+    ggml_free(ctx);
+}
+
+TEST_CASE("ggml_d3d12: SWIGLU rules") {
+    D3d12SwigluDesc d;
+    d.ne0 = 11008;
+    d.ne1 = 1;
+    d.two_sources = true;
+    d.glu_op_swiglu = true;
+    d.rows_contiguous = true;
+    d.same_shapes = true;
+    CHECK(d3d12_swiglu_supported(d));
+    d.ne1 = 512;
+    CHECK(d3d12_swiglu_supported(d));
+    auto bad = d;
+    bad.ne0 = 11004; // scalar libm tail on the CPU
+    CHECK_FALSE(d3d12_swiglu_supported(bad));
+    bad = d;
+    bad.two_sources = false; // fused [gate | up] tensor
+    CHECK_FALSE(d3d12_swiglu_supported(bad));
+    bad = d;
+    bad.swapped = true;
+    CHECK_FALSE(d3d12_swiglu_supported(bad));
+    bad = d;
+    bad.glu_op_swiglu = false; // GEGLU, SWIGLU_OAI, ...
+    CHECK_FALSE(d3d12_swiglu_supported(bad));
+    bad = d;
+    bad.src0_type = GGML_TYPE_F16;
+    CHECK_FALSE(d3d12_swiglu_supported(bad));
+    bad = d;
+    bad.rows_contiguous = false;
+    CHECK_FALSE(d3d12_swiglu_supported(bad));
+    bad = d;
+    bad.ne2 = 2;
+    CHECK_FALSE(d3d12_swiglu_supported(bad));
+}
