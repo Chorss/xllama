@@ -1109,6 +1109,7 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         #include "ggml_d3d12_mmv_q6_k_t64_dxil.h"
         #include "ggml_d3d12_quantize_q8_0_dxil.h"
         #include "ggml_d3d12_quantize_q8_k_dxil.h"
+        #include "ggml_d3d12_rmsnorm_probe_dxil.h"
         #include "ggml_d3d12_rope_f32_dxil.h"
         #include "ggml_d3d12_swiglu_f32_dxil.h"
         #include "xllama/d3d12_dyn.h"
@@ -1158,6 +1159,10 @@ struct Gpu {
     // d3d12-swiglu.txt = 1: SWIGLU (separate gate and up) runs here.
     ComPtr<ID3D12PipelineState> pso_swiglu;
     bool swiglu = false;
+    // d3d12-rmsnorm-probe.txt = 1: selftest-only cost probe of a bit-exact
+    // RMS_NORM's serial double sum; no graph op uses it.
+    ComPtr<ID3D12PipelineState> pso_rmsnorm_probe;
+    bool rmsnorm_probe = false;
     ComPtr<ID3D12QueryHeap> ts;
     ComPtr<ID3D12Resource> ts_rb;
     // #421 per-dispatch timing (d3d12-dispatch-timing.txt): one timestamp
@@ -1398,6 +1403,35 @@ bool init_gpu(Gpu& g) {
         }
     }
     log_output(std::string("[xllama] d3d12: swiglu=") + (g.swiglu ? "1" : "0") + "\n");
+    if (FILE* f = _wfopen(utf8_to_wstring(resolve_local_path("d3d12-rmsnorm-probe.txt")).c_str(),
+                          L"rb")) {
+        char config[16] = {};
+        const std::size_t bytes = std::fread(config, 1, sizeof(config), f);
+        std::fclose(f);
+        g.rmsnorm_probe = d3d12_flag_enabled(std::string_view(config, bytes));
+    }
+    if (g.rmsnorm_probe) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS opts = {};
+        const bool doubles = SUCCEEDED(g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS,
+                                                                     &opts, sizeof(opts))) &&
+                             opts.DoublePrecisionFloatShaderOps;
+        log_output(std::string("[xllama] d3d12: shader_doubles=") + (doubles ? "1" : "0") + "\n");
+        if (!doubles)
+            g.rmsnorm_probe = false;
+    }
+    if (g.rmsnorm_probe) {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+        pd.pRootSignature = g.root.Get();
+        pd.CS.pShaderBytecode = kGgmlD3d12RmsnormProbeDxil;
+        pd.CS.BytecodeLength = kGgmlD3d12RmsnormProbeDxilSize;
+        hr = g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_rmsnorm_probe));
+        if (FAILED(hr))
+            log_output("[xllama] d3d12: RMS_NORM probe unavailable: " +
+                       d3d12c::hr_message("CreateComputePipelineState", hr) + "\n");
+    }
+    if (g.rmsnorm_probe)
+        log_output(std::string("[xllama] d3d12: rmsnorm_probe=") +
+                   (g.pso_rmsnorm_probe ? "1" : "0") + "\n");
     if (SUCCEEDED(g.queue->GetTimestampFrequency(&g.ts_freq)) && g.ts_freq > 0) {
         D3D12_QUERY_HEAP_DESC qhd = {};
         qhd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
@@ -3331,6 +3365,104 @@ D3d12SelftestRow run_quant_chain_case(ggml_backend_t backend, ggml_type wt, int 
     return row;
 }
 
+constexpr int kD3d12RmsnormProbeMaxN = 4096; // MAX_N in ggml_d3d12_rmsnorm_probe.hlsl
+
+// d3d12-rmsnorm-probe.txt: GPU time of the serial double sum a bit-exact
+// RMS_NORM needs for one row of n floats (median of 5 dispatches), and whether
+// the GPU's double equals the host's sum of the same products in the same order.
+D3d12SelftestRow run_rmsnorm_probe_case(int n) {
+    D3d12SelftestRow row;
+    row.type = "rmsnorm_probe";
+    row.n = n;
+    row.ncols = 1;
+    Gpu& g = gpu();
+    if (n <= 0 || n > kD3d12RmsnormProbeMaxN) {
+        row.error = "width outside the probe's groupshared row";
+        return row;
+    }
+    if (!g.pso_rmsnorm_probe) {
+        row.error = "no RMS_NORM probe pipeline (shader_doubles=0 or PSO failed)";
+        return row;
+    }
+    if (!g.ts || !g.ts_rb || g.ts_freq == 0) {
+        row.error = "no GPU timestamps";
+        return row;
+    }
+    constexpr std::size_t kOut = 256; // the double's 8 bytes, then the row
+    ggml_backend_buffer_t buf =
+        ggml_backend_buft_alloc_buffer(&kHostBuft, kOut + static_cast<std::size_t>(n) * 4);
+    if (!buf) {
+        row.error = "buffer allocation failed";
+        return row;
+    }
+    auto* base = static_cast<std::uint8_t*>(ggml_backend_buffer_get_base(buf));
+    const D3D12_GPU_VIRTUAL_ADDRESS va = static_cast<BufCtx*>(buf->context)->va;
+    auto* x = reinterpret_cast<float*>(base + kOut);
+    // Activation-like values with a few wide and a few tiny ones, so the
+    // double sum rounds (its order matters) and denormal products occur.
+    std::mt19937 rng(17u + static_cast<unsigned>(n));
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (int i = 0; i < n; ++i)
+        x[i] = i % 97 == 0 ? nd(rng) * 3.0e15f : i % 89 == 0 ? nd(rng) * 1.0e-22f : nd(rng);
+    double ref = 0.0;
+    for (int i = 0; i < n; ++i)
+        ref += static_cast<double>(x[i] * x[i]);
+    const std::uint32_t c[8] = {
+        static_cast<std::uint32_t>(n), static_cast<std::uint32_t>(n), 0, 0, 0, 0, 0, 0};
+    std::vector<double> ms;
+    bool identical = true;
+    double got = 0.0;
+    for (int rep = 0; rep < 5; ++rep) {
+        std::memset(base, 0xff, sizeof(double));
+        std::lock_guard<std::mutex> lock(g.mu);
+        const bool ran = run_now(g, [&](ID3D12GraphicsCommandList* cl) {
+            cl->SetComputeRootSignature(g.root.Get());
+            cl->SetPipelineState(g.pso_rmsnorm_probe.Get());
+            cl->SetComputeRoot32BitConstants(0, 8, c, 0);
+            cl->SetComputeRootUnorderedAccessView(2, va);
+            cl->SetComputeRootUnorderedAccessView(3, va + kOut);
+            cl->EndQuery(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            cl->Dispatch(1, 1, 1);
+            cl->EndQuery(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+            cl->ResolveQueryData(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, g.ts_rb.Get(), 0);
+        });
+        if (!ran) {
+            row.error = "submission failed";
+            ggml_backend_buffer_free(buf);
+            return row;
+        }
+        void* p = nullptr;
+        if (SUCCEEDED(g.ts_rb->Map(0, nullptr, &p))) {
+            const auto* t = static_cast<const std::uint64_t*>(p);
+            if (t[1] > t[0])
+                ms.push_back(1000.0 * static_cast<double>(t[1] - t[0]) /
+                             static_cast<double>(g.ts_freq));
+            g.ts_rb->Unmap(0, nullptr);
+        }
+        double rep_got = 0.0;
+        std::memcpy(&rep_got, base, sizeof(double));
+        const bool same = std::memcmp(&rep_got, &ref, sizeof(double)) == 0;
+        if (identical) // keep the first mismatch for rel_err
+            got = rep_got;
+        identical = identical && same;
+    }
+    ggml_backend_buffer_free(buf);
+    row.d3d12_ran = true;
+    if (ms.size() != 5) {
+        row.error = "missing GPU timestamps";
+        return row;
+    }
+    std::sort(ms.begin(), ms.end());
+    row.gpu_ms = ms[2];
+    row.rel_err = ref != 0.0 ? std::fabs(got - ref) / std::fabs(ref) : std::fabs(got);
+    row.ok = identical;
+    char note[96];
+    std::snprintf(note, sizeof(note), "bit_identical=%d min_ms=%.4f max_ms=%.4f", identical ? 1 : 0,
+                  ms.front(), ms.back());
+    row.error = note;
+    return row;
+}
+
 // SWIGLU (d3d12-swiglu.txt) against ggml-cpu's own SWIGLU on the same inputs:
 // the kernel reproduces the AVX2 + FMA vector path, so the output must be bit
 // identical. `staged` puts gate and up in a plain CPU buffer (copied into xq).
@@ -3587,6 +3719,11 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
             out->push_back(run_ffn_chain_case(backend, GGML_TYPE_Q6_K, 2048, 8192, 7));
         }
     }
+    // RMS_NORM cost probe (d3d12-rmsnorm-probe.txt): model widths from
+    // Coder-1.5B (1536) and Coder-3B (2048) up to 4096.
+    if (gpu().rmsnorm_probe)
+        for (const int n : {1536, 2048, 3072, 4096})
+            out->push_back(run_rmsnorm_probe_case(n));
     ggml_backend_free(backend);
 }
 

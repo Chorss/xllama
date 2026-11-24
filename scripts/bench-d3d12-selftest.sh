@@ -18,6 +18,8 @@
 # "swiglu cold_scratch=1"); with --require-gpu-quant too, also the three ffn_*
 # rows (gate, up, SWIGLU and down in one submission, same bits as two).
 # quant_*, swiglu* and ffn_* are correctness rows: no bandwidth floor.
+# rmsnorm_probe rows (d3d12-rmsnorm-probe.txt = 1, fork-only cost probe) are
+# printed as PROBE lines and left out of the gate.
 #
 # Prerequisites: CI MSVC package (unified or llamacpp) installed on Series S.
 # Usage:
@@ -145,6 +147,11 @@ fi
 python3 - "$OUT" "$REQUIRE_BIAS_ADD" "$REQUIRE_ROPE" "$REQUIRE_GPU_QUANT" "$REQUIRE_SWIGLU" <<'PY'
 import csv, math, sys
 rows = list(csv.DictReader(open(sys.argv[1])))
+# Cost-probe rows answer a question; they are printed, not gated.
+for r in rows:
+    if r["type"] == "rmsnorm_probe":
+        print(f"PROBE rmsnorm_probe n={r['n']} gpu_ms={r['gpu_ms']} ok={r['ok']} {r['error']}")
+rows = [r for r in rows if r["type"] != "rmsnorm_probe"]
 bad = [r for r in rows if r["ok"] != "1" or r["d3d12_ran"] != "1" or
        any(not math.isfinite(float(r[k])) or float(r[k]) < 0
            for k in ("rel_err", "gpu_ms", "packed_gbs"))]
