@@ -15,9 +15,11 @@
 #     -denorm preserve; -D Q8_K=1 for the q8_K blob)
 #   shaders/ggml_d3d12_swiglu_f32.hlsl → ggml_d3d12_swiglu_f32_dxil.h (cs_6_4, -denorm preserve)
 #   shaders/ggml_d3d12_rmsnorm_probe.hlsl → ggml_d3d12_rmsnorm_probe_dxil.h (cs_6_4,
-#     -denorm preserve; selftest cost probe, needs shader doubles; _u16 with -D UNROLL=1)
+#     -denorm preserve; selftest cost probe, needs shader doubles; _u16 -D UNROLL=1, _floor -D FLOOR=1)
+#   shaders/ggml_d3d12_fma_probe.hlsl → ggml_d3d12_fma_probe_{int,f64,mad}_dxil.h (cs_6_4,
+#     -denorm preserve; -D F64=1 / -D MAD=1; selftest cost probe of the fp32 fma emulations)
 #
-# Usage: compile-gpugemv-shader.sh [naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q6_k|get_rows_q6_k|add_bias_f32|rope_f32|quantize_q8_0|quantize_q8_k|swiglu_f32|rmsnorm_probe|rmsnorm_probe_u16 ...]
+# Usage: compile-gpugemv-shader.sh [naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q6_k|get_rows_q6_k|add_bias_f32|rope_f32|quantize_q8_0|quantize_q8_k|swiglu_f32|rmsnorm_probe|rmsnorm_probe_u16|rmsnorm_probe_floor|fma_probe_{int,f64,mad} ...]
 #        (default: all)
 # A different dxc release emits different bytes: regenerate only the targets
 # you changed so measured blobs stay the ones the CSVs were recorded with.
@@ -138,8 +140,24 @@ compile_target() {
 		"$ROOT/shaders/generated/ggml_d3d12_rmsnorm_probe_u16_dxil.h" \
 		"shaders/ggml_d3d12_rmsnorm_probe.hlsl -D UNROLL=1 -denorm preserve" "kGgmlD3d12RmsnormProbeU16Dxil" \
 		cs_6_4 -D UNROLL=1 -denorm preserve ;;
+	fma_probe_int) compile_one "$ROOT/shaders/ggml_d3d12_fma_probe.hlsl" \
+		"$ROOT/shaders/generated/ggml_d3d12_fma_probe_int_dxil.h" \
+		"shaders/ggml_d3d12_fma_probe.hlsl -denorm preserve" "kGgmlD3d12FmaProbeIntDxil" \
+		cs_6_4 -denorm preserve ;;
+	fma_probe_f64) compile_one "$ROOT/shaders/ggml_d3d12_fma_probe.hlsl" \
+		"$ROOT/shaders/generated/ggml_d3d12_fma_probe_f64_dxil.h" \
+		"shaders/ggml_d3d12_fma_probe.hlsl -D F64=1 -denorm preserve" "kGgmlD3d12FmaProbeF64Dxil" \
+		cs_6_4 -D F64=1 -denorm preserve ;;
+	fma_probe_mad) compile_one "$ROOT/shaders/ggml_d3d12_fma_probe.hlsl" \
+		"$ROOT/shaders/generated/ggml_d3d12_fma_probe_mad_dxil.h" \
+		"shaders/ggml_d3d12_fma_probe.hlsl -D MAD=1 -denorm preserve" "kGgmlD3d12FmaProbeMadDxil" \
+		cs_6_4 -D MAD=1 -denorm preserve ;;
+	rmsnorm_probe_floor) compile_one "$ROOT/shaders/ggml_d3d12_rmsnorm_probe.hlsl" \
+		"$ROOT/shaders/generated/ggml_d3d12_rmsnorm_probe_floor_dxil.h" \
+		"shaders/ggml_d3d12_rmsnorm_probe.hlsl -D FLOOR=1 -denorm preserve" "kGgmlD3d12RmsnormProbeFloorDxil" \
+		cs_6_4 -D FLOOR=1 -denorm preserve ;;
 	*)
-		echo "unknown target: $1 (naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q6_k|get_rows_q6_k|add_bias_f32|rope_f32|quantize_q8_0|quantize_q8_k|swiglu_f32|rmsnorm_probe|rmsnorm_probe_u16)" >&2
+		echo "unknown target: $1 (naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q6_k|get_rows_q6_k|add_bias_f32|rope_f32|quantize_q8_0|quantize_q8_k|swiglu_f32|rmsnorm_probe|rmsnorm_probe_u16|rmsnorm_probe_floor|fma_probe_int|fma_probe_f64|fma_probe_mad)" >&2
 		exit 2
 		;;
 	esac
@@ -147,7 +165,8 @@ compile_target() {
 
 if [[ $# -eq 0 ]]; then
 	set -- naive wave32 rows dot4 mmv_q4_0 mmv_q4_k mmv_q6_k get_rows_q6_k add_bias_f32 rope_f32 \
-		quantize_q8_0 quantize_q8_k swiglu_f32 rmsnorm_probe rmsnorm_probe_u16
+		quantize_q8_0 quantize_q8_k swiglu_f32 rmsnorm_probe rmsnorm_probe_u16 rmsnorm_probe_floor \
+		fma_probe_int fma_probe_f64 fma_probe_mad
 fi
 for target in "$@"; do
 	compile_target "$target"

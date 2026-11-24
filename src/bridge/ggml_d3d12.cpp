@@ -1156,6 +1156,9 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         #include "ggml-backend-impl.h"
         #include "ggml-backend.h"
         #include "ggml_d3d12_add_bias_f32_dxil.h"
+        #include "ggml_d3d12_fma_probe_f64_dxil.h"
+        #include "ggml_d3d12_fma_probe_int_dxil.h"
+        #include "ggml_d3d12_fma_probe_mad_dxil.h"
         #include "ggml_d3d12_get_rows_q6_k_dxil.h"
         #include "ggml_d3d12_mmv_q4_0_t128_dxil.h"
         #include "ggml_d3d12_mmv_q4_0_t64_dxil.h"
@@ -1166,6 +1169,7 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         #include "ggml_d3d12_quantize_q8_0_dxil.h"
         #include "ggml_d3d12_quantize_q8_k_dxil.h"
         #include "ggml_d3d12_rmsnorm_probe_dxil.h"
+        #include "ggml_d3d12_rmsnorm_probe_floor_dxil.h"
         #include "ggml_d3d12_rmsnorm_probe_u16_dxil.h"
         #include "ggml_d3d12_rope_f32_dxil.h"
         #include "ggml_d3d12_swiglu_f32_dxil.h"
@@ -1218,8 +1222,11 @@ struct Gpu {
     bool swiglu = false;
     // d3d12-rmsnorm-probe.txt = 1: selftest-only cost probe of a bit-exact
     // RMS_NORM's serial double sum; no graph op uses it.
-    ComPtr<ID3D12PipelineState> pso_rmsnorm_probe;
-    ComPtr<ID3D12PipelineState> pso_rmsnorm_probe_u16; // loads batched ahead of the adds
+    // Cost probes, selftest only: RMS_NORM's serial double sum (plain, loads
+    // batched by 16, adds-only floor) and a chain of fp32 fmas (integer
+    // emulation, double emulation, two-rounding mad floor).
+    ComPtr<ID3D12PipelineState> pso_rmsnorm_probe[3];
+    ComPtr<ID3D12PipelineState> pso_fma_probe[3];
     bool rmsnorm_probe = false;
     ComPtr<ID3D12QueryHeap> ts;
     ComPtr<ID3D12Resource> ts_rb;
@@ -1478,23 +1485,42 @@ bool init_gpu(Gpu& g) {
             g.rmsnorm_probe = false;
     }
     if (g.rmsnorm_probe) {
-        const void* blobs[2] = {kGgmlD3d12RmsnormProbeDxil, kGgmlD3d12RmsnormProbeU16Dxil};
-        const size_t sizes[2] = {kGgmlD3d12RmsnormProbeDxilSize, kGgmlD3d12RmsnormProbeU16DxilSize};
-        ComPtr<ID3D12PipelineState>* psos[2] = {&g.pso_rmsnorm_probe, &g.pso_rmsnorm_probe_u16};
-        for (int i = 0; i < 2; ++i) {
+        struct ProbeBlob {
+            const char* name;
+            const void* blob;
+            size_t size;
+            ComPtr<ID3D12PipelineState>* pso;
+        };
+        const ProbeBlob probes[] = {
+            {"rmsnorm_probe", kGgmlD3d12RmsnormProbeDxil, kGgmlD3d12RmsnormProbeDxilSize,
+             &g.pso_rmsnorm_probe[0]},
+            {"rmsnorm_probe_u16", kGgmlD3d12RmsnormProbeU16Dxil, kGgmlD3d12RmsnormProbeU16DxilSize,
+             &g.pso_rmsnorm_probe[1]},
+            {"rmsnorm_probe_floor", kGgmlD3d12RmsnormProbeFloorDxil,
+             kGgmlD3d12RmsnormProbeFloorDxilSize, &g.pso_rmsnorm_probe[2]},
+            {"fma_probe_int", kGgmlD3d12FmaProbeIntDxil, kGgmlD3d12FmaProbeIntDxilSize,
+             &g.pso_fma_probe[0]},
+            {"fma_probe_f64", kGgmlD3d12FmaProbeF64Dxil, kGgmlD3d12FmaProbeF64DxilSize,
+             &g.pso_fma_probe[1]},
+            {"fma_probe_mad", kGgmlD3d12FmaProbeMadDxil, kGgmlD3d12FmaProbeMadDxilSize,
+             &g.pso_fma_probe[2]},
+        };
+        std::string ok_list;
+        for (const ProbeBlob& pb : probes) {
             D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
             pd.pRootSignature = g.root.Get();
-            pd.CS.pShaderBytecode = blobs[i];
-            pd.CS.BytecodeLength = sizes[i];
-            hr = g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&*psos[i]));
+            pd.CS.pShaderBytecode = pb.blob;
+            pd.CS.BytecodeLength = pb.size;
+            hr = g.device->CreateComputePipelineState(
+                &pd, IID_PPV_ARGS(pb.pso->ReleaseAndGetAddressOf()));
             if (FAILED(hr))
-                log_output("[xllama] d3d12: RMS_NORM probe unavailable: " +
+                log_output(std::string("[xllama] d3d12: ") + pb.name + " unavailable: " +
                            d3d12c::hr_message("CreateComputePipelineState", hr) + "\n");
+            else
+                ok_list += std::string(ok_list.empty() ? "" : ",") + pb.name;
         }
+        log_output("[xllama] d3d12: cost probes=" + (ok_list.empty() ? "none" : ok_list) + "\n");
     }
-    if (g.rmsnorm_probe)
-        log_output(std::string("[xllama] d3d12: rmsnorm_probe=") +
-                   (g.pso_rmsnorm_probe ? "1" : "0") + "\n");
     if (SUCCEEDED(g.queue->GetTimestampFrequency(&g.ts_freq)) && g.ts_freq > 0) {
         D3D12_QUERY_HEAP_DESC qhd = {};
         qhd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
@@ -3563,9 +3589,125 @@ constexpr int kD3d12RmsnormProbeMaxN = 4096; // MAX_N in ggml_d3d12_rmsnorm_prob
 // d3d12-rmsnorm-probe.txt: GPU time of the serial double sum a bit-exact
 // RMS_NORM needs for one row of n floats (median of 5 dispatches), and whether
 // the GPU's double equals the host's sum of the same products in the same order.
-D3d12SelftestRow run_rmsnorm_probe_case(int n, bool unrolled) {
+// fp32 fma chain cost (d3d12-rmsnorm-probe.txt): 8960 threads, nine dependent
+// fmas each (SWIGLU's longest chain). variant 0: integer fma_rn, 1: double
+// fma_f64, 2: two-rounding mad (timing floor). The results must equal the
+// host's chain: std::fmaf for 0 and 1, float mul then add for 2.
+D3d12SelftestRow run_fma_probe_case(int variant) {
     D3d12SelftestRow row;
-    row.type = unrolled ? "rmsnorm_probe_u16" : "rmsnorm_probe";
+    static const char* const kNames[3] = {"fma_probe_int", "fma_probe_f64", "fma_probe_mad"};
+    row.type = kNames[variant];
+    constexpr int n = 8960;
+    row.n = n;
+    row.ncols = 1;
+    Gpu& g = gpu();
+    ID3D12PipelineState* pso = g.pso_fma_probe[variant].Get();
+    if (!pso) {
+        row.error = "no fma probe pipeline";
+        return row;
+    }
+    if (!g.ts || !g.ts_rb || g.ts_freq == 0) {
+        row.error = "no GPU timestamps";
+        return row;
+    }
+    constexpr std::size_t in_off = 64 * 1024; // results first (35 KiB)
+    ggml_backend_buffer_t buf =
+        ggml_backend_buft_alloc_buffer(&kHostBuft, in_off + static_cast<std::size_t>(n) * 12);
+    if (!buf) {
+        row.error = "buffer allocation failed";
+        return row;
+    }
+    auto* base = static_cast<std::uint8_t*>(ggml_backend_buffer_get_base(buf));
+    const D3D12_GPU_VIRTUAL_ADDRESS va = static_cast<BufCtx*>(buf->context)->va;
+    auto* in = reinterpret_cast<float*>(base + in_off);
+    std::mt19937 rng(91u);
+    std::uniform_real_distribution<float> mag(0.7f, 1.4f);
+    for (int i = 0; i < n * 3; ++i)
+        in[i] = rng() & 1u ? mag(rng) : -mag(rng);
+    // A few chains start on a tie only the exact sum resolves:
+    // (1 + 2^-12)^2 = 1 + 2^-11 + 2^-24, c = ±2^-70.
+    for (int i = 0; i < 64; ++i) {
+        in[i * 3] = 1.0f + 0x1p-12f;
+        in[i * 3 + 1] = (i & 1 ? -1.0f : 1.0f) * (1.0f + 0x1p-12f);
+        in[i * 3 + 2] = (i & 2 ? -1.0f : 1.0f) * 0x1p-70f;
+    }
+    std::vector<std::uint32_t> ref(n);
+    for (int i = 0; i < n; ++i) {
+        float a = in[i * 3], b = in[i * 3 + 1], v = in[i * 3 + 2];
+        for (int k = 0; k < 9; ++k) {
+            float t;
+            if (variant == 2) {
+                volatile float p = a * b;
+                t = p + v;
+            } else {
+                t = std::fmaf(a, b, v);
+            }
+            a = b;
+            b = v;
+            v = t;
+        }
+        ref[i] = f32_bits(v);
+    }
+    const std::uint32_t c[8] = {static_cast<std::uint32_t>(n), 0, 0, 0, 0, 0, 0, 0};
+    std::vector<double> ms;
+    int first_diff = -1;
+    for (int rep = 0; rep < 5; ++rep) {
+        std::memset(base, 0xcd, static_cast<std::size_t>(n) * 4);
+        std::lock_guard<std::mutex> lock(g.mu);
+        const bool ran = run_now(g, [&](ID3D12GraphicsCommandList* cl) {
+            cl->SetComputeRootSignature(g.root.Get());
+            cl->SetPipelineState(pso);
+            cl->SetComputeRoot32BitConstants(0, 8, c, 0);
+            cl->SetComputeRootUnorderedAccessView(2, va);
+            cl->SetComputeRootUnorderedAccessView(3, va + in_off);
+            cl->EndQuery(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            cl->Dispatch((n + 255) / 256, 1, 1);
+            cl->EndQuery(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+            cl->ResolveQueryData(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, g.ts_rb.Get(), 0);
+        });
+        if (!ran) {
+            row.error = "submission failed";
+            ggml_backend_buffer_free(buf);
+            return row;
+        }
+        void* p = nullptr;
+        if (SUCCEEDED(g.ts_rb->Map(0, nullptr, &p))) {
+            const auto* t = static_cast<const std::uint64_t*>(p);
+            if (t[1] > t[0])
+                ms.push_back(1000.0 * static_cast<double>(t[1] - t[0]) /
+                             static_cast<double>(g.ts_freq));
+            g.ts_rb->Unmap(0, nullptr);
+        }
+        const auto* got = reinterpret_cast<const std::uint32_t*>(base);
+        for (int i = 0; i < n && first_diff < 0; ++i) {
+            const bool both_nan = std::isnan(bits_f32(got[i])) && std::isnan(bits_f32(ref[i]));
+            if (got[i] != ref[i] && !both_nan)
+                first_diff = i;
+        }
+    }
+    ggml_backend_buffer_free(buf);
+    row.d3d12_ran = true;
+    if (ms.size() != 5) {
+        row.error = "missing GPU timestamps";
+        return row;
+    }
+    std::sort(ms.begin(), ms.end());
+    row.gpu_ms = ms[2];
+    row.ok = first_diff < 0;
+    char note[96];
+    std::snprintf(note, sizeof(note), "first_diff=%d bit_identical=%d min_ms=%.4f max_ms=%.4f",
+                  first_diff, row.ok ? 1 : 0, ms.front(), ms.back());
+    row.error = note;
+    return row;
+}
+
+// variant: 0 plain, 1 loads batched by 16, 2 adds-only floor (register values;
+// the host sums the same values).
+D3d12SelftestRow run_rmsnorm_probe_case(int n, int variant) {
+    D3d12SelftestRow row;
+    static const char* const kNames[3] = {"rmsnorm_probe", "rmsnorm_probe_u16",
+                                          "rmsnorm_probe_floor"};
+    row.type = kNames[variant];
     row.n = n;
     row.ncols = 1;
     Gpu& g = gpu();
@@ -3573,7 +3715,7 @@ D3d12SelftestRow run_rmsnorm_probe_case(int n, bool unrolled) {
         row.error = "width outside the probe's groupshared row";
         return row;
     }
-    ID3D12PipelineState* pso = unrolled ? g.pso_rmsnorm_probe_u16.Get() : g.pso_rmsnorm_probe.Get();
+    ID3D12PipelineState* pso = g.pso_rmsnorm_probe[variant].Get();
     if (!pso) {
         row.error = "no RMS_NORM probe pipeline (shader_doubles=0 or PSO failed)";
         return row;
@@ -3600,7 +3742,10 @@ D3d12SelftestRow run_rmsnorm_probe_case(int n, bool unrolled) {
         x[i] = i % 97 == 0 ? nd(rng) * 3.0e15f : i % 89 == 0 ? nd(rng) * 1.0e-22f : nd(rng);
     double ref = 0.0;
     for (int i = 0; i < n; ++i)
-        ref += static_cast<double>(x[i] * x[i]);
+        ref +=
+            variant == 2
+                ? static_cast<double>(bits_f32(0x3f800000u + static_cast<std::uint32_t>(i) * 977u))
+                : static_cast<double>(x[i] * x[i]);
     const std::uint32_t c[8] = {
         static_cast<std::uint32_t>(n), static_cast<std::uint32_t>(n), 0, 0, 0, 0, 0, 0};
     std::vector<double> ms;
@@ -3916,10 +4061,15 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
     }
     // RMS_NORM cost probe (d3d12-rmsnorm-probe.txt): model widths from
     // Coder-1.5B (1536) and Coder-3B (2048) up to 4096.
-    if (gpu().rmsnorm_probe)
-        for (const bool unrolled : {false, true})
-            for (const int n : {1536, 2048, 3072, 4096})
-                out->push_back(run_rmsnorm_probe_case(n, unrolled));
+    if (gpu().rmsnorm_probe) {
+        // Variants back to back per width, so clock ramp-up hits them alike;
+        // 1537 runs the batched variant's scalar tail.
+        for (const int n : {1536, 1537, 2048, 3072, 4096})
+            for (const int variant : {0, 1, 2})
+                out->push_back(run_rmsnorm_probe_case(n, variant));
+        for (const int variant : {0, 1, 2})
+            out->push_back(run_fma_probe_case(variant));
+    }
     ggml_backend_free(backend);
 }
 

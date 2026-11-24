@@ -6,7 +6,8 @@
 // at a model's width: the group loads the row and forms the products (each
 // correctly rounded, `precise`, -denorm preserve), thread 0 sums them in double
 // precision from groupshared memory and stores the double's bits.
-// Built twice: plain loop, and -D UNROLL=1 (loads batched ahead of the adds).
+// Built three times: plain loop; -D UNROLL=1 (loads batched ahead of the adds);
+// -D FLOOR=1 (adds only, on register values: the double-add latency floor).
 // Root signature (src/bridge/ggml_d3d12.cpp): b0 constants, u0 the output
 // (two dwords per row), u1 the F32 input.
 
@@ -42,9 +43,15 @@ void CSMain(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
     if (tid != 0u)
         return;
     precise double s = 0.0;
-#ifdef UNROLL
+#if defined(FLOOR)
+    // Timing floor: the same n dependent double adds on values computed in
+    // registers (no groupshared load); the host sums the same values.
+    for (uint j = 0u; j < m; ++j)
+        s = s + (double)asfloat(0x3f800000u + j * 977u);
+#elif defined(UNROLL)
     // Sixteen independent groupshared loads first, then the sixteen dependent
-    // adds in the same order, so the load latency leaves the critical path.
+    // adds in the same order: the load latency is paid once per sixteen adds
+    // (if the driver keeps this schedule), not removed.
     uint j = 0u;
     for (; j + 16u <= m; j += 16u) {
         float v[16];
