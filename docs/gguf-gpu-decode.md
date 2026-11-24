@@ -1186,11 +1186,20 @@ Debug). NaN inputs follow the CPU too: the `q8_0` kernel reduces `|x|` in the
 tree and with the max semantics of the AVX2 code, the division returns the
 first NaN operand and the fp16 conversion keeps the payload, as F16C does
 (host test with NaNs at every position of a block); the `q8_K` search skips a
-NaN like the reference's `>` does. The SWIGLU kernel below does not reproduce
-NaN payloads.
+NaN like the reference's `>` does. The `q8_K` kernel gives each 256-value block
+a group of 32 threads, eight values per thread. The reference keeps the first
+index of the largest `|x|`. Each thread finds its own first maximum, and a
+reduction tree keeps the larger `|x|` and, on a tie, the smaller index. That
+picks the same element whatever the reduction order, so a tie of opposite
+signs keeps the reference's sign. The host twin runs the same lanes and tree.
+The test covers ties across lanes and at the block's ends. It also checks the
+twin against a serial search on NaN and ±inf, inputs where ggml's own
+`nearest_int` asserts. The SWIGLU kernel below does not reproduce NaN payloads.
 
 The quantize runs only for an input in `D3D12_Host`, the buffer every output of
-a submission lands in, and only when `g.xq` already has room for it. Otherwise
+a submission lands in, only when its dispatch fits D3D12's 65535 thread
+groups per dimension (blocks per column for `q8_K`, columns), and only when
+`g.xq` already has room for it. Otherwise
 the backend ends the submission and quantizes on the CPU, as without the file,
 because growing `g.xq` would drop what is already staged; it then grows `g.xq`
 to what the submission needed, so the next one (for example the next layer of
@@ -1206,13 +1215,25 @@ operations stay available. On its own the knob changes no split of a catalogue
 model, because nothing on the GPU feeds a projection yet. It is the
 prerequisite for the SWIGLU knob below.
 
-Checks: the host tests `*integer fp32 division*`, `*fp32 to fp16 rounding*` and
-`*GPU activation quantization*` (doctest names). The console selftest runs
+Checks: the host tests `*integer fp32 division*`, `*fp32 to fp16 rounding*`,
+`*GPU activation quantization*`, `*q8_K parallel max*` and `*quantize dispatch
+shape*` (doctest names). The console selftest runs
 six `quant_*` rows: a chain `W2 · (W1 · x)`, run once with the GPU quantize and
 once without, Q4_0, Q4_K and Q6_K weights, decode and 7 columns, and an
 11008-wide input. A row passes only when the two outputs are identical bits and
 the chain took one submission with the knob and two without.
-`bench-d3d12-selftest.sh --require-gpu-quant` requires the six rows. The quantize
+Such a chain cannot catch a wrong pick between equal `|x|` of opposite signs:
+that negates the block's `d`, quants and sums together, and the dot product
+comes out the same. A `quant_q8_K_bytes` row therefore runs the `q8_K` kernel
+alone on two 8960-value columns (an odd input stride, an output row that
+is not a multiple of 8 bytes) and compares its bytes. The first column holds ties
+of both signs across lanes and at a block's ends, every lane on the same
+`|max|`, subnormals, a zero block, and a block each with NaN and ±inf; the
+second is the first reversed within each block, so each tie's other sign comes
+first. The
+finite blocks must equal ggml's `from_float` and every block the host twin.
+`bench-d3d12-selftest.sh --require-gpu-quant` requires the six chain rows and
+the bytes row. The quantize
 always follows a matmul whose CPU-quantized input allocated `g.xq` or a
 dispatch that ran without it, so it is never the first user of the staging
 buffer; with no room it falls back as above.

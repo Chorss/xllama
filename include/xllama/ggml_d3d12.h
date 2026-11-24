@@ -133,16 +133,33 @@ struct D3d12SwigluDesc {
 bool d3d12_swiglu_supported(const D3d12SwigluDesc& d);
 inline constexpr int kD3d12SwigluThreads = 256;
 
-inline constexpr int kD3d12QuantThreads = 64; // threads per group of the quantize kernel
-// Threads of work per column: one per pair of q8_0 blocks (68 B, whole dwords)
-// or per q8_K block. 0 when k does not split evenly (the matmul rules already
-// require k % 256 == 0).
+inline constexpr int kD3d12QuantThreads = 64;    // threads per group of the q8_0 quantize
+inline constexpr int kD3d12QuantQ8KThreads = 32; // threads per group (= per block) of the q8_K one
+// Work units per column: one thread per pair of q8_0 blocks (68 B, whole
+// dwords) or one thread group per q8_K block. 0 when k does not split evenly
+// (the matmul rules already require k % 256 == 0).
 inline std::int64_t d3d12_quant_units(ggml_type activation, std::int64_t k) {
     if (activation == GGML_TYPE_Q8_0)
         return k > 0 && k % 64 == 0 ? k / 64 : 0;
     if (activation == GGML_TYPE_Q8_K)
         return k > 0 && k % 256 == 0 ? k / 256 : 0;
     return 0;
+}
+// Thread groups along x for one column of `units` (d3d12_quant_units).
+// 0 for a type with no quantize kernel.
+inline std::int64_t d3d12_quant_groups(ggml_type activation, std::int64_t units) {
+    if (units <= 0)
+        return 0;
+    if (activation == GGML_TYPE_Q8_K)
+        return units;
+    if (activation == GGML_TYPE_Q8_0)
+        return (units + kD3d12QuantThreads - 1) / kD3d12QuantThreads;
+    return 0;
+}
+inline int d3d12_quant_threads(ggml_type activation) {
+    if (activation == GGML_TYPE_Q8_K)
+        return kD3d12QuantQ8KThreads;
+    return activation == GGML_TYPE_Q8_0 ? kD3d12QuantThreads : 0;
 }
 
 // Host emulation of the shaders' per-thread lane mapping, unaligned loads and

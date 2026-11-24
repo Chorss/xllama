@@ -14,15 +14,16 @@
 //   - fp32 division is not correctly rounded on D3D12, so div_rn
 //     (ggml_d3d12_fp32_rn.hlsli) divides the significands on integers;
 //   - HLSL round() rounds half to even, like _mm256_round_ps(_MM_ROUND_NEAREST).
-// One thread per pair of q8_0 blocks (68 B, so every store is a whole dword)
-// or per q8_K block (292 B); SV_GroupID.y is the activation column.
+// q8_0: one thread per pair of blocks (68 B, so every store is a whole dword).
+// q8_K: one group of 32 threads per block (292 B). SV_GroupID.y is the
+// activation column.
 // Root signature (src/bridge/ggml_d3d12.cpp): b0 constants, u0 the quantized
 // output (the staging buffer), u1 the F32 input.
 
-#define NUM_THREADS 64 // kD3d12QuantThreads
+#define NUM_THREADS 64 // kD3d12QuantThreads (q8_0)
 
 cbuffer Params : register(b0) {
-    uint nunits;    // threads of work per column: k / 64 (q8_0) or k / 256 (q8_K)
+    uint nunits;    // work units per column: k / 64 (q8_0 threads) or k / 256 (q8_K groups)
     uint x_stride;  // floats between input columns
     uint out_row;   // bytes between quantized columns
     uint pad0;
@@ -141,62 +142,107 @@ void CSMain(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
 
 #else // Q8_K
 
-[numthreads(NUM_THREADS, 1, 1)]
+// One group of Q8K_THREADS per q8_K block (kD3d12QuantQ8KThreads): thread t
+// owns elements 8t..8t+7, which is also its two quant dwords; threads 2j and
+// 2j+1 make up bsums[j]. SV_GroupID.x is the block, SV_GroupID.y the column.
+#define Q8K_THREADS 32
+
+groupshared float s_mx[Q8K_THREADS];
+groupshared uint s_idx[Q8K_THREADS];
+groupshared int s_sum[Q8K_THREADS];
+
+[numthreads(Q8K_THREADS, 1, 1)]
 void CSMain(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
-    const uint u = gid.x * NUM_THREADS + tid; // one q8_K block
-    if (u >= nunits)
+    const uint u = gid.x; // q8_K block
+    if (u >= nunits) // whole group: uniform, before any barrier
         return;
     const uint col = gid.y;
-    const uint i0 = u * 256u;
+    const uint i0 = u * 256u + tid * 8u;
     const uint o = col * out_row + u * 292u;
-    // First index of the largest |x| (strict > on floats, as
-    // quantize_row_q8_K_ref: a NaN never compares greater and is skipped).
+    // quantize_row_q8_K_ref keeps the first index of the largest |x| (strict >
+    // on floats: a NaN never compares greater and is skipped). Each thread
+    // finds its own first maximum; the tree keeps the larger |x| and, on a tie,
+    // the smaller index, which is the same element in any reduction order.
+    float x[8];
     float amax = 0.0f;
     float mx = 0.0f;
-    for (uint j = 0u; j < 256u; ++j) {
-        const float x = ldx(col, i0 + j);
-        const float ax = abs(x);
+    uint idx = 256u; // none above 0 yet
+    const uint a = (col * x_stride + i0) * 4u;
+    const uint4 lo4 = X.Load4(a);
+    const uint4 hi4 = X.Load4(a + 16u);
+    x[0] = asfloat(lo4.x);
+    x[1] = asfloat(lo4.y);
+    x[2] = asfloat(lo4.z);
+    x[3] = asfloat(lo4.w);
+    x[4] = asfloat(hi4.x);
+    x[5] = asfloat(hi4.y);
+    x[6] = asfloat(hi4.z);
+    x[7] = asfloat(hi4.w);
+    [unroll] for (uint j = 0u; j < 8u; ++j) {
+        const float ax = abs(x[j]);
         if (ax > amax) {
             amax = ax;
-            mx = x;
+            mx = x[j];
+            idx = tid * 8u + j;
         }
     }
-    if (amax == 0.0f) {
-        for (uint z = 0u; z < 73u; ++z)
-            Q.Store(o + z * 4u, 0u);
+    s_mx[tid] = mx;
+    s_idx[tid] = idx;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint step = Q8K_THREADS / 2u; step > 0u; step >>= 1u) {
+        if (tid < step) {
+            const float ba = abs(s_mx[tid + step]);
+            const float aa = abs(s_mx[tid]); // |mx| is the lane's amax
+            const uint bi = s_idx[tid + step];
+            if (ba > aa || (ba == aa && bi < s_idx[tid])) {
+                s_mx[tid] = s_mx[tid + step];
+                s_idx[tid] = bi;
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (s_mx[0] == 0.0f) { // no |x| above 0 (or only NaN)
+        Q.Store2(o + 4u + tid * 8u, uint2(0u, 0u));
+        if ((tid & 3u) == 0u)
+            Q.Store(o + 260u + tid, 0u);
+        if (tid == 0u)
+            Q.Store(o, 0u);
         return;
     }
-    const float iscale = asfloat(div_rn(0xc2fe0000u, asuint(mx))); // -127.0f / max
-    int prev = 0;
-    for (uint g = 0u; g < 16u; ++g) {
-        int sum = 0;
-        uint w[4];
-        [unroll] for (uint wi = 0u; wi < 4u; ++wi) {
-            uint packed = 0u;
-            [unroll] for (uint b = 0u; b < 4u; ++b) {
-                precise const float fv = iscale * ldx(col, i0 + g * 16u + wi * 4u + b);
-                int v = 0;
-                // nearest_int; a non-finite fv stores 0, as on x86.
-                if (((asuint(fv) >> 23) & 0xffu) != 0xffu) {
-                    precise const float t = fv + 12582912.0f;
-                    v = int(asuint(t) & 0x007fffffu) - 0x00400000;
-                }
-                v = min(127, v);
-                const int q8 = int(uint(v) << 24) >> 24; // the int8 the CPU stores
-                sum += q8;
-                packed |= (uint(v) & 0xffu) << (8u * b);
+    // max is non-zero and not NaN here (the strict > skips NaN); it may be
+    // ±inf, which gives iscale = -0 and stores 0 for every quant, as on x86.
+    const uint iscale_bits = div_rn(0xc2fe0000u, asuint(s_mx[0])); // -127.0f / max
+    const float iscale = asfloat(iscale_bits);
+    int sum = 0;
+    uint w[2];
+    [unroll] for (uint wi = 0u; wi < 2u; ++wi) {
+        uint packed = 0u;
+        [unroll] for (uint b = 0u; b < 4u; ++b) {
+            precise const float fv = iscale * x[wi * 4u + b];
+            int v = 0;
+            // nearest_int; a non-finite fv stores 0, as on x86.
+            if (((asuint(fv) >> 23) & 0xffu) != 0xffu) {
+                precise const float t = fv + 12582912.0f;
+                v = int(asuint(t) & 0x007fffffu) - 0x00400000;
             }
-            w[wi] = packed;
+            v = min(127, v);
+            sum += int(uint(v) << 24) >> 24; // the int8 the CPU stores
+            packed |= (uint(v) & 0xffu) << (8u * b);
         }
-        [unroll] for (uint s = 0u; s < 4u; ++s)
-            Q.Store(o + 4u + g * 16u + s * 4u, w[s]);
-        // bsums are int16 pairs: store each dword once both halves are known.
-        if ((g & 1u) == 0u)
-            prev = sum;
-        else
-            Q.Store(o + 260u + (g - 1u) * 2u, (uint(prev) & 0xffffu) | (uint(sum) << 16));
+        w[wi] = packed;
     }
-    Q.Store(o, div_rn(0x3f800000u, asuint(iscale))); // d = 1 / iscale
+    Q.Store2(o + 4u + tid * 8u, uint2(w[0], w[1]));
+    s_sum[tid] = sum;
+    GroupMemoryBarrierWithGroupSync();
+    // bsums[j] = threads 2j + 2j+1; a dword holds bsums[j], bsums[j+1] (j even),
+    // so thread t = 2j with t % 4 == 0 stores it at byte 260 + 2j = 260 + t.
+    if ((tid & 3u) == 0u) {
+        const int lo = s_sum[tid] + s_sum[tid + 1u];
+        const int hi = s_sum[tid + 2u] + s_sum[tid + 3u];
+        Q.Store(o + 260u + tid, (uint(lo) & 0xffffu) | (uint(hi) << 16));
+    }
+    if (tid == 0u)
+        Q.Store(o, div_rn(0x3f800000u, iscale_bits)); // d = 1 / iscale
 }
 
 #endif

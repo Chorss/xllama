@@ -870,6 +870,45 @@ void check_quant_equal(ggml_type at, const std::vector<float>& x) {
     CHECK(first == row);
 }
 
+// quantize_row_q8_K_ref's serial order (one pass for the max, strict >), with
+// the kernels' NaN-safe nearest_int: the reference for inputs ggml's own
+// nearest_int asserts on in Debug (NaN, inf), to check the parallel max.
+std::vector<std::uint8_t> serial_q8_K(const std::vector<float>& x) {
+    const int k = static_cast<int>(x.size());
+    std::vector<std::uint8_t> out(static_cast<std::size_t>(k / 256) * 292, 0);
+    for (int b = 0; b < k / 256; ++b) {
+        const float* xb = x.data() + b * 256;
+        std::uint8_t* o = out.data() + b * 292;
+        float amax = 0.0f, mx = 0.0f;
+        for (int j = 0; j < 256; ++j)
+            if (std::fabs(xb[j]) > amax) {
+                amax = std::fabs(xb[j]);
+                mx = xb[j];
+            }
+        if (amax == 0.0f)
+            continue;
+        const std::uint32_t is = d3d12_f32_div_rn(as_bits(-127.0f), as_bits(mx));
+        std::int32_t sums[16] = {};
+        for (int j = 0; j < 256; ++j) {
+            const float fv = from_bits(is) * xb[j];
+            std::int32_t v = 0;
+            if (std::isfinite(fv))
+                v = static_cast<std::int32_t>(as_bits(fv + 12582912.0f) & 0x007fffffu) - 0x00400000;
+            v = std::min(127, v);
+            const auto q = static_cast<std::int8_t>(static_cast<std::uint8_t>(v & 0xff));
+            o[4 + j] = static_cast<std::uint8_t>(q);
+            sums[j / 16] += q;
+        }
+        for (int g = 0; g < 16; ++g) {
+            const auto s16 = static_cast<std::int16_t>(sums[g]);
+            std::memcpy(o + 260 + g * 2, &s16, 2);
+        }
+        const std::uint32_t d = d3d12_f32_div_rn(as_bits(1.0f), is);
+        std::memcpy(o, &d, 4);
+    }
+    return out;
+}
+
 } // namespace
 
 TEST_CASE("ggml_d3d12: integer fp32 division is correctly rounded") {
@@ -980,6 +1019,41 @@ TEST_CASE("ggml_d3d12: GPU activation quantization equals ggml byte for byte") {
         pm[3] = 5.0f;
         pm[9] = -5.0f;
         check_quant_equal(at, pm);
+        // q8_K's parallel max: equal |x| of both signs in different lanes
+        // (lane t owns 8t..8t+7) and at the block's ends; the first index wins.
+        const int tie_pairs[][2] = {{7, 8},     {8, 7},   {0, 255},   {255, 0}, {15, 16},
+                                    {127, 128}, {248, 7}, {100, 101}, {31, 224}};
+        for (const auto& tp : tie_pairs) {
+            CAPTURE(tp[0]);
+            CAPTURE(tp[1]);
+            std::vector<float> tie(256);
+            for (float& v : tie)
+                v = nd(rng);
+            tie[tp[0]] = -9.75f;
+            tie[tp[1]] = 9.75f;
+            check_quant_equal(at, tie);
+            tie[tp[0]] = 9.75f;
+            tie[tp[1]] = -9.75f;
+            check_quant_equal(at, tie);
+        }
+        // The same |max| in every lane, alternating signs.
+        std::vector<float> every(256, 0.5f);
+        for (int t = 0; t < 32; ++t)
+            every[t * 8 + (t % 8)] = t % 2 ? 3.0f : -3.0f;
+        check_quant_equal(at, every);
+        // Subnormals next to a normal maximum, and the decode widths of
+        // Coder-1.5B (1536 embd, 8960 ffn).
+        std::vector<float> sub(512);
+        for (std::size_t i = 0; i < sub.size(); ++i)
+            sub[i] = i % 3 ? from_bits(static_cast<std::uint32_t>(1u + i * 4099u) & 0x807fffffu)
+                           : nd(rng);
+        check_quant_equal(at, sub);
+        for (const int wide : {1536, 8960}) {
+            std::vector<float> xw(static_cast<std::size_t>(wide));
+            for (float& v : xw)
+                v = nd(rng) * 4.0f;
+            check_quant_equal(at, xw);
+        }
         // All-zero and (q8_0 only, see above) single-subnormal blocks.
         std::vector<float> z(256, 0.0f);
         check_quant_equal(at, z);
@@ -1000,6 +1074,47 @@ TEST_CASE("ggml_d3d12: GPU activation quantization equals ggml byte for byte") {
             check_quant_equal(at, nan_row);
         }
     }
+}
+
+TEST_CASE("ggml_d3d12: q8_K parallel max equals the serial one on NaN and inf") {
+    std::mt19937 rng(23);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    const float specials[] = {from_bits(0x7fc00000u), from_bits(0xffc12345u),
+                              from_bits(0x7f800001u), std::numeric_limits<float>::infinity(),
+                              -std::numeric_limits<float>::infinity()};
+    for (const float sp : specials)
+        for (const int pos : {0, 7, 8, 31, 128, 255}) {
+            CAPTURE(as_bits(sp));
+            CAPTURE(pos);
+            std::vector<float> x(512);
+            for (float& v : x)
+                v = nd(rng);
+            x[pos] = sp;
+            x[256 + (pos * 37) % 256] = sp;
+            if (pos % 2)
+                x[pos ^ 8] = -sp; // a second special in a neighbouring lane
+            std::vector<std::uint8_t> got(2 * 292, 0xcd);
+            d3d12_quantize_q8_K_emulate(x.data(), 512, got.data());
+            CHECK(got == serial_q8_K(x));
+        }
+    // A block of only NaN is a zero block, as in the reference.
+    std::vector<float> nan_only(256, from_bits(0x7fc00000u));
+    std::vector<std::uint8_t> got(292, 0xcd);
+    d3d12_quantize_q8_K_emulate(nan_only.data(), 256, got.data());
+    CHECK(got == std::vector<std::uint8_t>(292, 0));
+    CHECK(serial_q8_K(nan_only) == got);
+}
+
+TEST_CASE("ggml_d3d12: quantize dispatch shape") {
+    CHECK(d3d12_quant_groups(GGML_TYPE_Q8_K, d3d12_quant_units(GGML_TYPE_Q8_K, 8960)) == 35);
+    CHECK(d3d12_quant_groups(GGML_TYPE_Q8_K, d3d12_quant_units(GGML_TYPE_Q8_K, 1536)) == 6);
+    CHECK(d3d12_quant_groups(GGML_TYPE_Q8_0, d3d12_quant_units(GGML_TYPE_Q8_0, 2048)) == 1);
+    CHECK(d3d12_quant_groups(GGML_TYPE_Q8_0, d3d12_quant_units(GGML_TYPE_Q8_0, 11008)) == 3);
+    CHECK(d3d12_quant_groups(GGML_TYPE_Q8_K, 0) == 0);
+    CHECK(d3d12_quant_threads(GGML_TYPE_Q8_K) == kD3d12QuantQ8KThreads);
+    CHECK(d3d12_quant_threads(GGML_TYPE_Q8_0) == kD3d12QuantThreads);
+    CHECK(d3d12_quant_groups(GGML_TYPE_Q8_1, 4) == 0);
+    CHECK(d3d12_quant_threads(GGML_TYPE_F32) == 0);
 }
 
 TEST_CASE("ggml_d3d12: integer fp32 fma is correctly rounded") {

@@ -12,7 +12,8 @@
 # correctness rows, so the decode bandwidth floor does not apply to them.
 # --require-gpu-quant requires the six quant_* rows (d3d12-gpu-quant.txt = 1):
 # a two-matmul chain bit-identical with and without the GPU quantize, in one
-# submission with it and two without.
+# submission with it and two without. It also requires one quant_q8_K_bytes
+# row (2 columns): the q8_K kernel alone, byte for byte.
 # --require-swiglu requires the three swiglu* rows (d3d12-swiglu.txt = 1), bit
 # identical to ggml-cpu, the first run with a cold scratch buffer (log line
 # "swiglu cold_scratch=1"); with --require-gpu-quant too, also the three ffn_*
@@ -184,9 +185,14 @@ def kind(prefix):
     return [(r["type"], r["ncols"]) for r in rows if r["type"].startswith(prefix)]
 quant_expected = [("quant_q8_0", "1"), ("quant_q8_K", "1"), ("quant_q8_0", "7"),
                   ("quant_q8_K", "7"), ("quant_q8_0", "1"), ("quant_q8_K", "1")]
-quant_ok = kind("quant_") == quant_expected
+quant_got = [q for q in kind("quant_") if q[0] != "quant_q8_K_bytes"]
+quant_ok = quant_got == quant_expected
 if require_gpu_quant and not quant_ok:
-    print(f"FAIL expected the six quant_* rows {quant_expected}; found {kind('quant_')}")
+    print(f"FAIL expected the six quant_* rows {quant_expected}; found {quant_got}")
+# The q8_K kernel alone, byte for byte (ties, subnormals, zeros, NaN, inf).
+bytes_ok = kind("quant_q8_K_bytes") == [("quant_q8_K_bytes", "2")]
+if require_gpu_quant and not bytes_ok:
+    print(f"FAIL expected one quant_q8_K_bytes row; found {kind('quant_q8_K_bytes')}")
 # The in-place decode row runs first (cold scratch), the rest after the matmuls.
 swiglu_expected = [("swiglu", "1"), ("swiglu", "7"), ("swiglu_staged", "3")]
 swiglu_ok = kind("swiglu") == swiglu_expected
@@ -198,6 +204,7 @@ if require_swiglu and require_gpu_quant and not ffn_ok:
     print(f"FAIL expected the three ffn_* rows {ffn_expected}; found {kind('ffn_')}")
 passed = (bool(rows) and not bad and not slow and (not require_bias_add or bias_add_first) and
           (not require_rope or rope_ok) and (not require_gpu_quant or quant_ok) and
+          (not require_gpu_quant or bytes_ok) and
           (not require_swiglu or swiglu_ok) and
           (not (require_swiglu and require_gpu_quant) or ffn_ok))
 print("GATE=" + ("PASS" if passed else "FAIL"))

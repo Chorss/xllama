@@ -689,23 +689,46 @@ void d3d12_quantize_q8_0_emulate(const float* x, int k, std::uint8_t* out) {
 }
 
 void d3d12_quantize_q8_K_emulate(const float* x, int k, std::uint8_t* out) {
+    // The kernel's algorithm: 32 lanes of 8 elements, a reduction tree for the
+    // maximum, bsums from lane pairs (shaders/ggml_d3d12_quantize_q8.hlsl).
+    constexpr int kLanes = kD3d12QuantQ8KThreads;
+    static_assert(kLanes * 8 == 256 && kLanes % 2 == 0, "8 values per lane, bsums from lane pairs");
     for (int b = 0; b < k / 256; ++b, x += 256, out += 292) {
-        // First index of the largest |x| (quantize_row_q8_K_ref's strict >).
-        float amax = 0.0f, max = 0.0f;
-        for (int j = 0; j < 256; ++j) {
-            const float ax = std::fabs(x[j]);
-            if (ax > amax) {
-                amax = ax;
-                max = x[j];
+        // Per lane: first index of its largest |x| (strict >, a NaN never wins).
+        // |mx| is the lane's amax, as in the kernel.
+        float mx[kLanes];
+        unsigned idx[kLanes];
+        for (int t = 0; t < kLanes; ++t) {
+            mx[t] = 0.0f;
+            idx[t] = 256;
+            for (int j = 0; j < 8; ++j) {
+                if (std::fabs(x[t * 8 + j]) > std::fabs(mx[t])) {
+                    mx[t] = x[t * 8 + j];
+                    idx[t] = static_cast<unsigned>(t * 8 + j);
+                }
             }
         }
-        std::int8_t qs[256] = {};
-        float d = 0.0f;
-        if (amax != 0.0f) {
-            const float iscale = bits_f32(d3d12_f32_div_rn(f32_bits(-127.0f), f32_bits(max)));
-            // max is a finite non-zero float here: the strict > above skips NaN.
-            for (int j = 0; j < 256; ++j) {
-                const float fv = iscale * x[j];
+        // Tree: the larger |x| wins, a tie goes to the smaller index.
+        for (int step = kLanes / 2; step > 0; step /= 2)
+            for (int t = 0; t < step; ++t) {
+                const float ba = std::fabs(mx[t + step]), aa = std::fabs(mx[t]);
+                if (ba > aa || (ba == aa && idx[t + step] < idx[t])) {
+                    mx[t] = mx[t + step];
+                    idx[t] = idx[t + step];
+                }
+            }
+        std::memset(out, 0, 292);
+        if (mx[0] == 0.0f) // no |x| above 0 (or only NaN)
+            continue;
+        // max is non-zero and not NaN here (the strict > skips NaN); it may be
+        // ±inf, which gives iscale = -0 and stores 0 for every quant.
+        const std::uint32_t iscale_bits = d3d12_f32_div_rn(f32_bits(-127.0f), f32_bits(mx[0]));
+        const float iscale = bits_f32(iscale_bits);
+        std::int32_t lane_sum[kLanes];
+        for (int t = 0; t < kLanes; ++t) {
+            lane_sum[t] = 0;
+            for (int j = 0; j < 8; ++j) {
+                const float fv = iscale * x[t * 8 + j];
                 // nearest_int: the low mantissa bits of fv + 1.5 * 2^23. A
                 // non-finite fv (|max| tiny enough for iscale to overflow)
                 // stores 0 on x86 for both inf and the default NaN.
@@ -714,19 +737,17 @@ void d3d12_quantize_q8_K_emulate(const float* x, int k, std::uint8_t* out) {
                     v = static_cast<std::int32_t>(f32_bits(fv + 12582912.0f) & 0x007fffffu) -
                         0x00400000;
                 v = std::min(127, v);
-                qs[j] = static_cast<std::int8_t>(static_cast<std::uint8_t>(v & 0xff));
+                const auto q8 = static_cast<std::int8_t>(static_cast<std::uint8_t>(v & 0xff));
+                out[4 + t * 8 + j] = static_cast<std::uint8_t>(q8);
+                lane_sum[t] += q8;
             }
-            d = bits_f32(d3d12_f32_div_rn(f32_bits(1.0f), f32_bits(iscale)));
         }
-        std::memcpy(out, &d, 4);
-        std::memcpy(out + 4, qs, 256);
         for (int g = 0; g < 16; ++g) {
-            std::int32_t s = 0;
-            for (int i = 0; i < 16; ++i)
-                s += qs[g * 16 + i];
-            const std::int16_t s16 = static_cast<std::int16_t>(s);
+            const auto s16 = static_cast<std::int16_t>(lane_sum[2 * g] + lane_sum[2 * g + 1]);
             std::memcpy(out + 260 + g * 2, &s16, 2);
         }
+        const float d = bits_f32(d3d12_f32_div_rn(f32_bits(1.0f), iscale_bits));
+        std::memcpy(out, &d, 4);
     }
 }
 
@@ -1900,7 +1921,7 @@ D3d12DispatchKind op_kind(const Op& op) {
     k.op = "quant";
     k.type = ggml_type_name(d3d12_activation_type(op.node->src[0]->type));
     k.cols = d3d12_cols_class(op.src->ne[1]);
-    k.threads = kD3d12QuantThreads;
+    k.threads = d3d12_quant_threads(d3d12_activation_type(op.node->src[0]->type));
     return k;
 }
 
@@ -1976,9 +1997,8 @@ bool submit_ops(Gpu& g, const std::vector<Op>& ops) {
                     cl->SetComputeRoot32BitConstants(0, 8, c, 0);
                     cl->SetComputeRootUnorderedAccessView(2, xq_va + op.xq_off);
                     cl->SetComputeRootUnorderedAccessView(3, tensor_va(x));
-                    cl->Dispatch(
-                        static_cast<UINT>((units + kD3d12QuantThreads - 1) / kD3d12QuantThreads),
-                        static_cast<UINT>(x->ne[1]), 1);
+                    cl->Dispatch(static_cast<UINT>(d3d12_quant_groups(at, units)),
+                                 static_cast<UINT>(x->ne[1]), 1);
                     after_dispatch();
                     continue;
                 }
@@ -2430,8 +2450,10 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         // An input this submission produces lives in D3D12_Host (every output
         // here does): quantize it on the GPU, or end the submission so the CPU
         // can read it.
+        const std::int64_t q_groups = d3d12_quant_groups(at, d3d12_quant_units(at, k));
         const bool gpu_q = from_batch && g.gpu_quant && x->buffer->buft == &kHostBuft &&
-                           d3d12_quant_units(at, k) > 0;
+                           q_groups > 0 && q_groups <= kD3d12MaxGroups &&
+                           x->ne[1] <= kD3d12MaxGroups;
         if (from_batch && !gpu_q && !flush())
             return GGML_STATUS_FAILED;
         const Quantized* q = nullptr;
@@ -3288,6 +3310,135 @@ void gpu_quant_on_off(ggml_backend_t backend, ggml_cgraph* gf, ggml_tensor* y, s
     row->error = !finite ? "non-finite output" : note;
 }
 
+// The q8_K quantize kernel on its own, compared byte for byte: a chain through
+// a matmul cannot see a wrong tie between equal |x| of opposite signs, because
+// that negates d, qs and bsums together and the dot product comes out the same.
+// Two columns of 8960 values (Coder-1.5B's FFN width, 35 blocks), an odd input
+// stride and a 4-mod-8 output row, as g.xq has: ties of both signs across lanes
+// and at the ends of a block, every lane on the same |max|, subnormals beside a
+// normal maximum, a zero block, then NaN and inf; the second column is the
+// first reversed within each block. Finite blocks must equal ggml's
+// from_float, every block the host twin. gpu_ms times the one dispatch.
+D3d12SelftestRow run_quant_bytes_case() {
+    D3d12SelftestRow row;
+    row.type = "quant_q8_K_bytes";
+    constexpr int k = 8960;
+    constexpr int ncols = 2;
+    constexpr int blocks = k / 256;
+    constexpr std::size_t x_stride = k + 1;                                 // floats
+    constexpr std::size_t out_row = static_cast<std::size_t>(blocks) * 292; // 10220 = 4 mod 8
+    constexpr std::size_t qbytes = out_row * ncols;
+    constexpr std::size_t x_off = (qbytes + 255) / 256 * 256;
+    row.n = k;
+    row.ncols = ncols;
+    Gpu& g = gpu();
+    ggml_backend_buffer_t buf =
+        ggml_backend_buft_alloc_buffer(&kHostBuft, x_off + x_stride * ncols * 4);
+    if (!buf) {
+        row.error = "buffer allocation failed";
+        return row;
+    }
+    auto* base = static_cast<std::uint8_t*>(ggml_backend_buffer_get_base(buf));
+    const D3D12_GPU_VIRTUAL_ADDRESS va = static_cast<BufCtx*>(buf->context)->va;
+    auto* x = reinterpret_cast<float*>(base + x_off);
+    std::mt19937 rng(4242u);
+    std::uniform_real_distribution<float> uni(-1.f, 1.f);
+    for (int i = 0; i < k; ++i)
+        x[i] = uni(rng);
+    const auto at = [&](int block, int i) -> float& { return x[block * 256 + i]; };
+    // Lane t of the kernel owns elements 8t..8t+7 of a block.
+    const int tie_pairs[][2] = {{7, 8}, {8, 7}, {0, 255}, {255, 0}, {248, 3}, {127, 128}};
+    int blk = 0;
+    for (const auto& tp : tie_pairs) {
+        at(blk, tp[0]) = -4.5f; // the first index's sign must win
+        at(blk, tp[1]) = 4.5f;
+        ++blk;
+    }
+    for (int t = 0; t < 32; ++t) // every lane on the same |max|, signs alternate
+        at(blk, t * 8 + t % 8) = t % 2 ? 3.25f : -3.25f;
+    ++blk;
+    for (int i = 0; i < 256; ++i) // subnormals beside a normal maximum
+        at(blk, i) = i == 200 ? -2.0f : i % 2 ? std::ldexp(uni(rng), -130) : uni(rng);
+    ++blk;
+    for (int i = 0; i < 256; ++i) // a zero block
+        at(blk, i) = 0.0f;
+    const int finite_blocks = blocks - 2;
+    at(blocks - 2, 17) = std::numeric_limits<float>::quiet_NaN(); // skipped by the max
+    at(blocks - 2, 40) = -6.0f;
+    at(blocks - 1, 9) = std::numeric_limits<float>::infinity();
+    at(blocks - 1, 200) = -std::numeric_limits<float>::infinity();
+    for (int b = 0; b < blocks; ++b) // column 1: each block reversed
+        for (int i = 0; i < 256; ++i)
+            x[x_stride + b * 256 + i] = x[b * 256 + 255 - i];
+    std::memset(base, 0xcd, qbytes);
+    const std::uint32_t c[8] = {static_cast<std::uint32_t>(blocks),
+                                static_cast<std::uint32_t>(x_stride),
+                                static_cast<std::uint32_t>(out_row),
+                                0,
+                                0,
+                                0,
+                                0,
+                                0};
+    const bool ts = g.ts && g.ts_rb && g.ts_freq > 0;
+    bool ran = false;
+    {
+        std::lock_guard<std::mutex> lock(g.mu);
+        ran = run_now(g, [&](ID3D12GraphicsCommandList* cl) {
+            cl->SetComputeRootSignature(g.root.Get());
+            cl->SetPipelineState(g.pso_quant[1].Get());
+            cl->SetComputeRoot32BitConstants(0, 8, c, 0);
+            cl->SetComputeRootUnorderedAccessView(2, va);
+            cl->SetComputeRootUnorderedAccessView(3, va + x_off);
+            if (ts)
+                cl->EndQuery(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            cl->Dispatch(static_cast<UINT>(d3d12_quant_groups(GGML_TYPE_Q8_K, blocks)), ncols, 1);
+            if (ts) {
+                cl->EndQuery(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                cl->ResolveQueryData(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, g.ts_rb.Get(),
+                                     0);
+            }
+        });
+        void* p = nullptr;
+        if (ran && ts && SUCCEEDED(g.ts_rb->Map(0, nullptr, &p))) {
+            const auto* t = static_cast<const std::uint64_t*>(p);
+            if (t[1] > t[0])
+                row.gpu_ms =
+                    1000.0 * static_cast<double>(t[1] - t[0]) / static_cast<double>(g.ts_freq);
+            g.ts_rb->Unmap(0, nullptr);
+        }
+    }
+    row.d3d12_ran = ran;
+    if (!ran) {
+        row.error = "submission failed";
+        ggml_backend_buffer_free(buf);
+        return row;
+    }
+    int bad_ggml = -1, bad_twin = -1;
+    std::vector<std::uint8_t> want(out_row), twin(out_row);
+    for (int col = 0; col < ncols; ++col) {
+        const float* xc = x + x_stride * col;
+        const std::uint8_t* got = base + out_row * col;
+        ggml_get_type_traits_cpu(GGML_TYPE_Q8_K)
+            ->from_float(xc, want.data(), static_cast<std::int64_t>(finite_blocks) * 256);
+        d3d12_quantize_q8_K_emulate(xc, k, twin.data());
+        const std::size_t finite_bytes = static_cast<std::size_t>(finite_blocks) * 292;
+        for (std::size_t i = 0; i < out_row; ++i) {
+            const int pos = static_cast<int>(out_row * col + i);
+            if (bad_ggml < 0 && i < finite_bytes && got[i] != want[i])
+                bad_ggml = pos;
+            if (bad_twin < 0 && got[i] != twin[i])
+                bad_twin = pos;
+        }
+    }
+    ggml_backend_buffer_free(buf);
+    row.ok = bad_ggml < 0 && bad_twin < 0;
+    char note[96];
+    std::snprintf(note, sizeof(note), "first_diff_ggml=%d first_diff_twin=%d bit_identical=%d",
+                  bad_ggml, bad_twin, row.ok ? 1 : 0);
+    row.error = note;
+    return row;
+}
+
 // GPU quantize (d3d12-gpu-quant.txt): y2 = W2 · (W1 · x), so the second
 // matmul's input is produced inside the submission. With the knob the backend
 // quantizes it on the GPU (one submission); without it, it ends the submission
@@ -3707,6 +3858,7 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         out->push_back(run_quant_chain_case(backend, GGML_TYPE_Q6_K, 2048, 2048, 7));
         out->push_back(run_quant_chain_case(backend, GGML_TYPE_Q4_0, 11008, 2048, 1));
         out->push_back(run_quant_chain_case(backend, GGML_TYPE_Q4_K, 11008, 2048, 1));
+        out->push_back(run_quant_bytes_case());
     }
     // SWIGLU (d3d12-swiglu.txt): Coder-3B's FFN width, a ubatch in place and a
     // staged one; then whole FFN chains when the GPU quantize is on too.

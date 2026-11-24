@@ -170,11 +170,13 @@ class D3d12SelftestExitTests(unittest.TestCase):
                     ok="1", d3d12_ran="1", error="-")
         quant = [dict(base, type=t, ncols=c) for t, c in
                  (("quant_q8_0", "1"), ("quant_q8_K", "1"), ("quant_q8_0", "7"),
-                  ("quant_q8_K", "7"), ("quant_q8_0", "1"), ("quant_q8_K", "1"))]
+                  ("quant_q8_K", "7"), ("quant_q8_0", "1"), ("quant_q8_K", "1"),
+                  ("quant_q8_K_bytes", "2"))]
         swiglu = [dict(base, type=t, ncols=c) for t, c in
                   (("swiglu", "1"), ("swiglu", "7"), ("swiglu_staged", "3"))]
         ffn = [dict(base, type=t, ncols=c) for t, c in
                (("ffn_q4_0", "1"), ("ffn_q4_K", "1"), ("ffn_q6_K", "7"))]
+        add = [dict(base, type="add_f32", ncols="2")]
         # argv after the CSV: bias, rope, gpu-quant, swiglu.
         cases = [
             (quant, ["0", "0", "1", "0"], True),
@@ -189,6 +191,12 @@ class D3d12SelftestExitTests(unittest.TestCase):
             (quant + swiglu + ffn[:2], ["0", "0", "1", "1"], False),
             # Correctness rows carry no bandwidth: never SLOW, required or not.
             (quant + swiglu + ffn, [], True),
+            # The q8_K bytes row: exactly once, and it must pass.
+            (quant[:6], ["0", "0", "1", "0"], False),
+            (quant + quant[6:], ["0", "0", "1", "0"], False),
+            (quant[:6] + [dict(quant[6], ok="0")], ["0", "0", "1", "0"], False),
+            (quant[:6] + [dict(quant[6], ncols="1")], ["0", "0", "1", "0"], False),
+            (add + quant, ["1", "0", "1", "0"], True),
         ]
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "rows.csv"
