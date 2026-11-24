@@ -724,8 +724,15 @@ InferenceResult run_inference_llama(const InferenceParams& params) {
     // Before attach: pool workers read the flag. Always set, so a CPU-only run
     // after a d3d12 one in the same process goes back to the upstream spin.
     apply_cpu_relax_pause(cpu_tuning.relax_pause);
+    // Prompt lookup's speculative batches have no per-token profile: keep the
+    // probe off rather than pay for timings nobody logs.
+    const bool op_timing = cpu_tuning.op_timing && !params.prompt_lookup;
+    if (cpu_tuning.op_timing && params.prompt_lookup)
+        log_output("[xllama] cpu-op-timing ignored: prompt lookup\n");
+    apply_cpu_op_timing(op_timing);
     cpu_pools.attach(gpu_layers, ctx.get(), static_cast<int>(cparams.n_threads),
-                     static_cast<int>(cparams.n_threads_batch), cpu_tuning.decode_poll);
+                     static_cast<int>(cparams.n_threads_batch), cpu_tuning.decode_poll,
+                     cpu_tuning.decode_prio);
     if (cpu_tuning.any())
         log_output(format_cpu_tuning(cpu_tuning, static_cast<int>(cparams.n_threads_batch)));
 
@@ -910,12 +917,24 @@ InferenceResult run_inference_llama(const InferenceParams& params) {
     dlp.token_history = params.prompt_lookup ? &gen_history : nullptr;
     dlp.watchdog = &wd;
     CpuPhaseTimes cpu_times;
-    if (cpu_tuning.timing && !params.prompt_lookup)
+    if ((cpu_tuning.timing || cpu_tuning.op_timing) && !params.prompt_lookup)
         dlp.cpu_times = &cpu_times;
+    // Zero the op counters prefill left behind (patches/0003; no-op elsewhere).
+    const bool op_profile = dlp.cpu_times && op_timing && take_cpu_op_stats(nullptr);
     wd.enter_decode(params.n_predict);
     const DecodeLoopResult dlr = decode_loop(dlp, res.output_text);
     if (dlp.cpu_times)
         log_output(format_cpu_phase("decode", cpu_times));
+    CpuOpStats op_stats;
+    if (op_profile && take_cpu_op_stats(&op_stats)) {
+        std::vector<CpuOpRow> rows;
+        for (std::size_t i = 0; i < op_stats.op_n.size(); ++i)
+            rows.push_back({ggml_op_name(static_cast<ggml_op>(i)),
+                            static_cast<double>(op_stats.op_us[i]) / 1000.0, op_stats.op_n[i]});
+        log_output(format_cpu_op_profile("decode", rows,
+                                         static_cast<double>(op_stats.barrier_us) / 1000.0,
+                                         op_stats.graphs, cpu_times.tokens));
+    }
     if (gpu_layers > 0 && ggml_d3d12_take_stats(&d3d12_phase)) {
         log_output(format_d3d12_phase("decode", d3d12_phase));
         const std::string per = format_d3d12_dispatch_profile("decode", d3d12_phase.dispatch);

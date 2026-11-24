@@ -9,6 +9,7 @@
 #include "ggml-cpu.h"
 #include "gguf.h"
 #include "llama.h"
+#include "xllama/cpu_tuning.h"
 #include "xllama/ggml_d3d12.h"
 #include "xllama/platform.h"
 #include "xllama/speculative.h"
@@ -16,6 +17,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <thread>
 
 namespace xllama {
 
@@ -170,18 +172,28 @@ class GgufCpuThreadpools {
 
     // |n_threads| sizes the decode (1-token) pool, |n_threads_batch| the
     // prefill pool. |decode_poll| >= 0 overrides the decode pool's polling
-    // level (decode_poll.txt, cpu_tuning.h) and forces a separate prefill
-    // pool so prefill keeps ggml's default.
+    // level (decode_poll.txt, cpu_tuning.h) and |decode_prio| >= 0 its
+    // ggml_sched_priority (decode_prio.txt); either forces a separate prefill
+    // pool so prefill workers keep ggml's defaults. ggml_threadpool_new also
+    // gives the calling thread the decode priority; reset() restores the
+    // previous one when called on that same thread (run_inference's stack
+    // object always is).
     void attach(int applied_layers, llama_context* ctx, int n_threads, int n_threads_batch,
-                int decode_poll = -1) {
+                int decode_poll = -1, int decode_prio = -1) {
         if (applied_layers <= 0 || !ctx || n_threads <= 0)
             return;
         if (!tp_) {
             ggml_threadpool_params p = ggml_threadpool_params_default(n_threads);
             if (decode_poll >= 0)
                 p.poll = static_cast<uint32_t>(decode_poll);
+            if (decode_prio >= 0) {
+                p.prio = static_cast<ggml_sched_priority>(decode_prio);
+                saved_prio_ = current_thread_priority();
+                prio_thread_ = std::this_thread::get_id();
+            }
             tp_ = ggml_threadpool_new(&p);
-            if (n_threads_batch > 0 && (n_threads_batch != n_threads || decode_poll >= 0)) {
+            if (n_threads_batch > 0 &&
+                (n_threads_batch != n_threads || decode_poll >= 0 || decode_prio >= 0)) {
                 ggml_threadpool_params pb = ggml_threadpool_params_default(n_threads_batch);
                 tp_batch_ = ggml_threadpool_new(&pb);
             }
@@ -196,11 +208,16 @@ class GgufCpuThreadpools {
         if (tp_)
             ggml_threadpool_free(tp_);
         tp_ = tp_batch_ = nullptr;
+        if (saved_prio_ != kNoThreadPriority && prio_thread_ == std::this_thread::get_id())
+            set_current_thread_priority(saved_prio_);
+        saved_prio_ = kNoThreadPriority;
     }
 
   private:
     ggml_threadpool_t tp_ = nullptr;
     ggml_threadpool_t tp_batch_ = nullptr;
+    int saved_prio_ = kNoThreadPriority; // caller's priority before a decode_prio pool
+    std::thread::id prio_thread_;
 };
 
 } // namespace xllama

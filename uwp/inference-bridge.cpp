@@ -327,38 +327,37 @@ void main_loop() {
 
     const std::string hardware_host =
         ::xllama::declared_benchmark_host(read_local_file("bench_hardware.txt"));
-    char host_buf[112];
-    int host_len = snprintf(host_buf, sizeof(host_buf), "%s", hardware_host.c_str());
+    // std::string, not a fixed buffer: the tag list keeps growing with knobs.
+    std::string host = hardware_host;
     if (bench_threads > 0)
-        host_len +=
-            snprintf(host_buf + host_len, sizeof(host_buf) - host_len, "-t%d", bench_threads);
+        host += "-t" + std::to_string(bench_threads);
     if (bench_ubatch > 0)
-        host_len +=
-            snprintf(host_buf + host_len, sizeof(host_buf) - host_len, "-u%d", bench_ubatch);
+        host += "-u" + std::to_string(bench_ubatch);
     if (bench_kvq8 != 0)
-        host_len += snprintf(host_buf + host_len, sizeof(host_buf) - host_len, "-kvq8");
+        host += "-kvq8";
     if (bench_gpu_layers > 0)
-        host_len +=
-            snprintf(host_buf + host_len, sizeof(host_buf) - host_len, "-g%d", bench_gpu_layers);
+        host += "-g" + std::to_string(bench_gpu_layers);
     if (bench_ignore_eog != 0)
-        host_len += snprintf(host_buf + host_len, sizeof(host_buf) - host_len, "-noeog");
+        host += "-noeog";
     if (bench_greedy)
-        host_len += snprintf(host_buf + host_len, sizeof(host_buf) - host_len, "-greedy");
+        host += "-greedy";
     if (bench_gpu_layers > 0) {
         // cpu_tuning.h knobs change decode while the n_threads column keeps
         // the prefill count; tag them so a row cannot pass for a baseline.
         const ::xllama::CpuDecodeTuning ct = ::xllama::read_cpu_decode_tuning();
         if (ct.decode_threads > 0)
-            host_len += snprintf(host_buf + host_len, sizeof(host_buf) - host_len, "-dt%d",
-                                 ct.decode_threads);
+            host += "-dt" + std::to_string(ct.decode_threads);
         if (ct.decode_poll >= 0)
-            host_len += snprintf(host_buf + host_len, sizeof(host_buf) - host_len, "-poll%d",
-                                 ct.decode_poll);
+            host += "-poll" + std::to_string(ct.decode_poll);
         if (ct.relax_pause)
-            host_len += snprintf(host_buf + host_len, sizeof(host_buf) - host_len, "-pause");
+            host += "-pause";
+        if (ct.op_timing) // the probe itself changes timing
+            host += "-optime";
+        if (ct.decode_prio >= 0)
+            host += "-prio" + std::to_string(ct.decode_prio);
     }
     if (bench_prompt_lookup != 0)
-        snprintf(host_buf + host_len, sizeof(host_buf) - host_len, "-plookup");
+        host += "-plookup";
 
     InferenceResult res = ::xllama::run_inference(params);
     if (params.prompt_lookup) {
@@ -370,7 +369,7 @@ void main_loop() {
                  res.n_spec_accepted);
         log_output(spec_buf);
     }
-    xllama::write_bench_csv(params, res, host_buf);
+    xllama::write_bench_csv(params, res, host.c_str());
 #endif
 }
 
