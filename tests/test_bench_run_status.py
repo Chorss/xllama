@@ -163,6 +163,45 @@ class D3d12SelftestExitTests(unittest.TestCase):
                                             text=True, capture_output=True)
                     self.assertEqual(result.returncode, 0 if passed else 1, result.stdout)
 
+    def test_require_gpu_quant_and_swiglu_rows(self):
+        script = (ROOT / "scripts/bench-d3d12-selftest.sh").read_text()
+        gate = script.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        base = dict(n="2048", k="2048", ncols="1", rel_err="0", gpu_ms="0.1", packed_gbs="0",
+                    ok="1", d3d12_ran="1", error="-")
+        quant = [dict(base, type=t, ncols=c) for t, c in
+                 (("quant_q8_0", "1"), ("quant_q8_K", "1"), ("quant_q8_0", "7"),
+                  ("quant_q8_K", "7"), ("quant_q8_0", "1"), ("quant_q8_K", "1"))]
+        swiglu = [dict(base, type=t, ncols=c) for t, c in
+                  (("swiglu", "1"), ("swiglu", "7"), ("swiglu_staged", "3"))]
+        ffn = [dict(base, type=t, ncols=c) for t, c in
+               (("ffn_q4_0", "1"), ("ffn_q4_K", "1"), ("ffn_q6_K", "7"))]
+        # argv after the CSV: bias, rope, gpu-quant, swiglu.
+        cases = [
+            (quant, ["0", "0", "1", "0"], True),
+            (quant[:5], ["0", "0", "1", "0"], False),
+            (quant[1:] + quant[:1], ["0", "0", "1", "0"], False),
+            ([dict(quant[0], ok="0")] + quant[1:], ["0", "0", "1", "0"], False),
+            (swiglu, ["0", "0", "0", "1"], True),
+            (swiglu[1:] + swiglu[:1], ["0", "0", "0", "1"], False),
+            (swiglu, ["0", "0", "1", "1"], False),  # both knobs: quant and ffn rows too
+            (quant + swiglu, ["0", "0", "1", "1"], False),  # ffn rows missing
+            (quant + swiglu + ffn, ["0", "0", "1", "1"], True),
+            (quant + swiglu + ffn[:2], ["0", "0", "1", "1"], False),
+            # Correctness rows carry no bandwidth: never SLOW, required or not.
+            (quant + swiglu + ffn, [], True),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rows.csv"
+            for rows, extra, passed in cases:
+                with self.subTest(n=len(rows), extra=extra, passed=passed):
+                    with path.open("w", newline="") as stream:
+                        writer = csv.DictWriter(stream, fieldnames=list(base) + ["type"])
+                        writer.writeheader()
+                        writer.writerows(rows)
+                    result = subprocess.run([sys.executable, "-c", gate, str(path), *extra],
+                                            text=True, capture_output=True)
+                    self.assertEqual(result.returncode, 0 if passed else 1, result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -651,7 +651,8 @@ float d3d12_swiglu_emulate(float x, float g) {
 bool d3d12_swiglu_supported(const D3d12SwigluDesc& d) {
     return d.glu_op_swiglu && d.two_sources && !d.swapped && d.src0_type == GGML_TYPE_F32 &&
            d.src1_type == GGML_TYPE_F32 && d.dst_type == GGML_TYPE_F32 && d.rows_contiguous &&
-           d.same_shapes && d.ne0 > 0 && d.ne0 % 8 == 0 && d.ne1 >= 0 && d.ne2 == 1 && d.ne3 == 1 &&
+           d.same_shapes && !d.src_in_weight_buffer && !d.src_in_non_host_buffer && d.ne0 > 0 &&
+           d.ne0 % 8 == 0 && d.ne1 >= 0 && d.ne2 == 1 && d.ne3 == 1 &&
            (d.ne0 + kD3d12SwigluThreads - 1) / kD3d12SwigluThreads <= kD3d12MaxGroups &&
            d.ne1 <= kD3d12MaxGroups;
 }
@@ -1269,7 +1270,10 @@ bool init_gpu(Gpu& g) {
     if (!g.root && (g.rope || g.swiglu)) {
         // The opt-in must not take the backend down: fall back to the
         // four-parameter signature every other kernel was built against.
-        log_output("[xllama] d3d12: ROPE/SWIGLU unavailable: " + err + "\n");
+        if (g.rope)
+            log_output("[xllama] d3d12: ROPE unavailable: " + err + "\n");
+        if (g.swiglu)
+            log_output("[xllama] d3d12: SWIGLU unavailable: " + err + "\n");
         g.rope = false;
         g.swiglu = false;
         err.clear();
@@ -2287,7 +2291,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             for (int i = 0; i < 2; ++i) {
                 const ggml_tensor* t = node->src[i];
                 GGML_ASSERT(t->buffer && ggml_backend_buffer_is_host(t->buffer));
-                if (!is_ours(t->buffer->buft))
+                if (t->buffer->buft != &kHostBuft)
                     need += (dense(t) + 255) & ~std::size_t(255);
             }
             if (used + need > g.xq_bytes && !flush())
@@ -2296,7 +2300,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                 return GGML_STATUS_FAILED;
             for (int i = 0; i < 2; ++i) {
                 const ggml_tensor* t = node->src[i];
-                if (is_ours(t->buffer->buft))
+                if (t->buffer->buft == &kHostBuft)
                     continue;
                 const std::size_t row = static_cast<std::size_t>(t->ne[0]) * sizeof(float);
                 for (std::int64_t c = 0; c < t->ne[1]; ++c)
@@ -2376,8 +2380,8 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         // An input this submission produces lives in D3D12_Host (every output
         // here does): quantize it on the GPU, or end the submission so the CPU
         // can read it.
-        const bool gpu_q =
-            from_batch && g.gpu_quant && is_ours(x->buffer->buft) && d3d12_quant_units(at, k) > 0;
+        const bool gpu_q = from_batch && g.gpu_quant && x->buffer->buft == &kHostBuft &&
+                           d3d12_quant_units(at, k) > 0;
         if (from_batch && !gpu_q && !flush())
             return GGML_STATUS_FAILED;
         const Quantized* q = nullptr;
@@ -2629,10 +2633,10 @@ bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
         // Inputs the GPU reads must be host-visible (D3D12_Host or another CPU
         // buffer), never weights; activations without a buffer yet are the
         // scheduler's (D3D12_Host).
-        for (const ggml_tensor* t : {a, b})
-            if (t->buffer &&
-                (t->buffer->buft == &kWeightsBuft || !ggml_backend_buffer_is_host(t->buffer)))
-                return false;
+        for (const ggml_tensor* t : {a, b}) {
+            d.src_in_weight_buffer |= t->buffer && t->buffer->buft == &kWeightsBuft;
+            d.src_in_non_host_buffer |= t->buffer && !ggml_backend_buffer_is_host(t->buffer);
+        }
         return d3d12_swiglu_supported(d);
     }
     case GGML_OP_ADD: {
@@ -3540,6 +3544,12 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
     ggml_backend_t backend = dev_init_backend(&kDevice, nullptr);
     if (gpu().bias_add)
         out->push_back(run_bias_add_case(backend));
+    // The first SWIGLU in place, before anything has allocated the staging buffer
+    // (it binds none; the in-place bias ADD above does not allocate it either).
+    if (gpu().swiglu) {
+        log_cold_scratch("swiglu");
+        out->push_back(run_swiglu_case(backend, false, 11008, 1));
+    }
     // The first ROPE of the process, before any matmul has allocated the staging
     // buffer: its cos/sin table is the first thing staged there.
     if (gpu().rope) {
@@ -3582,10 +3592,9 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         out->push_back(run_quant_chain_case(backend, GGML_TYPE_Q4_0, 11008, 2048, 1));
         out->push_back(run_quant_chain_case(backend, GGML_TYPE_Q4_K, 11008, 2048, 1));
     }
-    // SWIGLU (d3d12-swiglu.txt): Coder-3B's FFN width, decode and a ubatch, in
-    // place and staged; then whole FFN chains when the GPU quantize is on too.
-    if (gpu().swiglu) {
-        out->push_back(run_swiglu_case(backend, false, 11008, 1));
+    // SWIGLU (d3d12-swiglu.txt): Coder-3B's FFN width, a ubatch in place and a
+    // staged one; then whole FFN chains when the GPU quantize is on too.
+    if (gpu().swiglu) { // the in-place decode row ran first, above
         out->push_back(run_swiglu_case(backend, false, 11008, 7));
         out->push_back(run_swiglu_case(backend, true, 8192, 3));
         if (gpu().gpu_quant) {

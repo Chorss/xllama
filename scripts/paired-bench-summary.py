@@ -8,14 +8,17 @@
 #
 #   scripts/paired-bench-summary.py <cell_dir> --gates prefill,decode,ttft,peak
 #                                   [--json-out PATH]
-#   scripts/paired-bench-summary.py <cell_dir> --profile bias-add|bias-add-control|rope
+#   scripts/paired-bench-summary.py <cell_dir> --profile bias-add|bias-add-control|rope|swiglu
 #                                   [--json-out PATH]
 # Profiles require 20 complete alternating pairs of one preregistered model and
 # host tag. bias-add-control also requires identical measured prefill and decode
 # submission counts in both arms of every pair. rope (A = bias ADD on, B = bias
 # ADD and ROPE on) shares the bias ADD gates and models, and requires B to
 # submit fewer decode and no more prefill batches than A in every pair, so a
-# speed-up cannot come from a knob that never took effect.
+# speed-up cannot come from a knob that never took effect. swiglu (A =
+# d3d12-gpu-quant.txt on, B = it and d3d12-swiglu.txt on; the GPU quantize
+# alone changes no split) shares the bias ADD gates, adds the LFM2.5-1.2B
+# control model (SWIGLU FFN, no biases) and has the same submission check.
 #
 # Pair i is row i of A.csv and row i of B.csv; only pairs whose two arms are
 # both recorded as ok in ledger.jsonl count. Per pair:
@@ -75,6 +78,7 @@ BIAS_ADD_MODELS = {
     "qwen25-coder-3b": "Q4_K_M",
 }
 BIAS_ADD_CONTROL_MODELS = {"lfm25-1.2b-instruct": "Q4_0"}
+SWIGLU_MODELS = {**BIAS_ADD_MODELS, **BIAS_ADD_CONTROL_MODELS}
 # profile: (gates, models, submission check). The check compares the measured
 # phase counters of the two arms of a pair: "equal" or "fewer" (B < A in decode,
 # B <= A in prefill); None reads no log.
@@ -82,6 +86,7 @@ PROFILES = {
     "bias-add": (BIAS_ADD_GATES, BIAS_ADD_MODELS, None),
     "bias-add-control": (BIAS_ADD_CONTROL_GATES, BIAS_ADD_CONTROL_MODELS, "equal"),
     "rope": (BIAS_ADD_GATES, BIAS_ADD_MODELS, "fewer"),
+    "swiglu": (BIAS_ADD_GATES, SWIGLU_MODELS, "fewer"),
 }
 BIAS_ADD_ROW_FIELDS = {
     "backend": "d3d12",

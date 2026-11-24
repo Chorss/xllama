@@ -16,6 +16,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   models and two ubatch sizes tried; Series S is not measured. Details:
   [GGUF GPU decode](docs/gguf-gpu-decode.md).
 
+- **Opt-in GPU activation quantize and SWIGLU for d3d12 GGUF layers.**
+  `LocalState\d3d12-gpu-quant.txt` set to `1` quantizes a matmul input that the
+  same submission produced on the GPU instead of ending the submission;
+  `LocalState\d3d12-swiglu.txt` set to `1` runs `SWIGLU` (separate gate and up,
+  `ne0` a multiple of 8) on the GPU. Both kernels are written to reproduce
+  ggml-cpu's x86 AVX2 + FMA path exactly, with integer division and fma where
+  D3D12 fp32 arithmetic is not correctly rounded; the host tests and the console
+  selftest rows require identical bits. With both files the FFN of a layer is
+  one submission. Not measured on Series S. Details:
+  [GGUF GPU decode](docs/gguf-gpu-decode.md).
+
 ## [1.8.0]
 
 User-facing notes: [docs/releases/v1.8.0.md](docs/releases/v1.8.0.md).

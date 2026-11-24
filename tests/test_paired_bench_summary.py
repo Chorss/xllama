@@ -227,6 +227,45 @@ class PairedSummaryTests(unittest.TestCase):
         r, _ = self.run_cell(cell, profile="rope")
         self.assertEqual(r.returncode, 2, r.stderr or r.stdout)
 
+    def test_swiglu_profile_accepts_coder_and_lfm_cells_and_checks_submissions(self):
+        for control in (False, True):
+            with self.subTest(control=control):
+                a = bias_rows(20, 100, 50, 1000, 800, 1, control=control)
+                b = bias_rows(20, 100, 53, 1000, 800, 2, control=control)
+                cell = write_cell(self.root / f"s{int(control)}", a, b)
+                self.write_rope_logs(cell)
+                r, v = self.run_cell(cell, profile="swiglu")
+                self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+                self.assertEqual(v["profile"], "swiglu")
+                # The GPU quantize alone: B submits as often as A, not the SWIGLU effect.
+                self.write_rope_logs(cell, b_decode=36)
+                r, _ = self.run_cell(cell, profile="swiglu")
+                self.assertEqual(r.returncode, 1, r.stderr or r.stdout)
+
+    def test_swiglu_profile_rejects_incomplete_or_unregistered_cells(self):
+        a = bias_rows(19, 100, 50, 1000, 800, 1)
+        cell = write_cell(self.root / "si", a, a)
+        self.assertEqual(self.run_cell(cell, profile="swiglu")[0].returncode, 2)
+        a = bias_rows(20, 100, 50, 1000, 800, 1)
+        b = bias_rows(20, 100, 53, 1000, 800, 2)
+        for row in a + b:
+            row["model"] = "bielik-4.5b-v3"
+        cell = write_cell(self.root / "su", a, b)
+        self.write_rope_logs(cell)
+        self.assertEqual(self.run_cell(cell, profile="swiglu")[0].returncode, 2)
+        a = bias_rows(20, 100, 50, 1000, 800, 1)
+        b = bias_rows(20, 100, 53, 1000, 800, 2)
+        cell = write_cell(self.root / "sm", a, b)
+        self.write_rope_logs(cell)
+        log = (cell / "pair4-B-app.log").read_text().splitlines(keepends=True)
+        (cell / "pair4-B-app.log").write_text("".join(log[:2]))  # warm-up only
+        self.assertEqual(self.run_cell(cell, profile="swiglu")[0].returncode, 2)
+        # One cell, one model: Coder A rows with LFM B rows are mixed.
+        mixed = write_cell(self.root / "sx", bias_rows(20, 100, 50, 1000, 800, 1),
+                           bias_rows(20, 100, 53, 1000, 800, 2, control=True))
+        self.write_rope_logs(mixed)
+        self.assertEqual(self.run_cell(mixed, profile="swiglu")[0].returncode, 2)
+
     def test_invalid_inputs_fail_closed(self):
         good = write_cell(self.root / "g", rows(4, 100, 50, 1000, 800, 1),
                           rows(4, 130, 50, 770, 800, 2))

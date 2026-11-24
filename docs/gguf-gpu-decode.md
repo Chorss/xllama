@@ -1066,11 +1066,12 @@ host-visible, `D3D12_Weights`, holds weights, which already have their buffer
 when `supports_op` runs. The compute-path asserts
 (`GGML_ASSERT(ggml_backend_buffer_is_host(...))`) are therefore invariants, not
 a path a model reaches. Any other `ROPE` stays on the CPU. Without the file no ROPE pipeline is created,
-`supports_op` refuses every `ROPE` and the root signature keeps four
-parameters. With the file, a ROPE setup failure is handled in one of two ways,
+`supports_op` refuses every `ROPE` and, unless `d3d12-swiglu.txt` asks for it
+(section below), the root signature keeps four parameters. With the file, a ROPE setup failure is handled in one of two ways,
 and both log `d3d12: ROPE unavailable: …` and `rope=0`. If the five-parameter root
 signature cannot be created, the backend falls back to the four-parameter
-signature and builds every other pipeline against it, as without the file. If
+signature, turns off both ROPE and SWIGLU (each logs its own `unavailable` line)
+and builds every other pipeline against it, as without the files. If
 only the ROPE pipeline fails, the other pipelines have already been built
 against the five-parameter signature and stay on it; the fifth parameter is
 then unused. Either way the other GPU operations stay available. A failure to
@@ -1154,6 +1155,115 @@ placement the knob leaves unchanged, and none has been identified; the host
 rules test cannot say whether LFM2.5's `ROPE` nodes are accepted. Naming one
 needs a node dump first.
 
+### GPU activation quantize on d3d12 (opt-in)
+
+The matmul kernels read their input quantized into the weight's `vec_dot`
+type (`q8_0` for Q4_0, `q8_K` for Q4_K and Q6_K), and the CPU does that
+quantization when it stages the input. A matmul whose input another dispatch of
+the same submission writes therefore ends the submission first, so the CPU can
+read that input. This is why moving the elementwise ops of a layer onto the GPU
+removes no split by itself: the next projection still waits for the CPU.
+
+With `LocalState\d3d12-gpu-quant.txt` containing `1` when the backend starts
+(boot log `d3d12: gpu_quant=1`), such an input is quantized on the GPU instead,
+inside the same submission: a quantize dispatch (`op=quant` in the per-dispatch
+and per-layer lines, attributed to the matmul's layer), a UAV barrier, then the
+matmul. The kernel (`shaders/ggml_d3d12_quantize_q8.hlsl`, built twice) must
+write the same bytes as ggml-cpu's x86 AVX2 `quantize_row_q8_0` and
+`quantize_row_q8_K_ref`, the functions the console's CPU path uses. fp32
+multiply and add are correctly rounded on D3D12 (D3D11.3 functional spec
+§3.1.3.1) and the blobs are built with `-denorm preserve` and `precise`
+products. fp32 division is not correctly rounded on D3D12, so the kernel
+divides the significands on integers (`d3d12_f32_div_rn`), and converts the
+`q8_0` scale to fp16 with an integer round-to-nearest-even
+(`d3d12_f32_to_f16_rn`). The host tests compare the host twins of those steps
+(`d3d12_quantize_q8_0_emulate`, `d3d12_quantize_q8_K_emulate`)
+with ggml's `from_float` and require byte for byte equality, over activation-like rows at several scales,
+rounding ties, equal magnitudes of both signs and subnormal blocks. For
+`q8_K`, inputs whose largest magnitude is below about 127 / `FLT_MAX` are left
+out, because there the reference itself is undefined (`nearest_int` asserts in
+Debug).
+
+The quantize runs only for an input in `D3D12_Host`, the buffer every output of
+a submission lands in, and only when `g.xq` already has room for it. Otherwise
+the backend ends the submission and quantizes on the CPU, as without the file,
+because growing `g.xq` would drop what is already staged. A quantized copy is
+also dropped when a later output of the submission overlaps the input it was
+made from, since gallocr can reuse that memory.
+
+Without the file no quantize pipeline is created and a matmul whose input the
+submission produced ends the submission. With the file, a failure to create
+either quantize pipeline logs `d3d12: GPU quantize unavailable: …` and
+`gpu_quant=0`. The other pipelines are already built, so the other GPU
+operations stay available. On its own the knob changes no split of a catalogue
+model, because nothing on the GPU feeds a projection yet. It is the
+prerequisite for the SWIGLU knob below.
+
+Checks: the host tests `*integer fp32 division*`, `*fp32 to fp16 rounding*` and
+`*GPU activation quantization*` (doctest names). The console selftest runs
+six `quant_*` rows: a chain `W2 · (W1 · x)`, run once with the GPU quantize and
+once without, Q4_0, Q4_K and Q6_K weights, decode and 7 columns, and an
+11008-wide input. A row passes only when the two outputs are identical bits and
+the chain took one submission with the knob and two without.
+`bench-d3d12-selftest.sh --require-gpu-quant` requires the six rows. The quantize
+always follows a matmul whose CPU-quantized input allocated `g.xq` or a
+dispatch that ran without it, so it is never the first user of the staging
+buffer; with no room it falls back as above.
+
+### SWIGLU on d3d12 (opt-in)
+
+With `LocalState\d3d12-swiglu.txt` containing `1` when the backend starts (boot
+log `d3d12: swiglu=1`), `supports_op` accepts a `GLU` that is `SWIGLU` with
+separate gate and up tensors (the form `build_ffn` emits), not swapped, F32,
+the same shape in and out, rows contiguous, `ne0` a multiple of 8, at most two
+dimensions, and whose inputs are not in `D3D12_Weights` or in a buffer that is
+not host-visible (`d3d12_swiglu_supported`). The multiple of 8 is needed because
+ggml-cpu computes a row's last `ne0 % 8` elements with libm `expf`, which the
+kernel does not reproduce. Inputs in `D3D12_Host` are read in place, inputs in
+another host buffer are staged. As for `ROPE`, activations get their buffer
+after `supports_op`, so the compute-path asserts on the input buffers are
+scheduler invariants. The file shapes the root signature (the kernel reads up
+through the third UAV, as `ROPE` reads its table). A failure to create the
+SWIGLU pipeline logs `d3d12: SWIGLU unavailable: …` and `swiglu=0`, and the
+other pipelines stay on the five-parameter signature they were built with.
+
+The kernel (`shaders/ggml_d3d12_swiglu_f32.hlsl`) reproduces the console's
+ggml-cpu path lane for lane: `ggml_vec_swiglu_f32` in its AVX2 + FMA form (MSVC
+`/arch:AVX2` defines `__FMA__` through `ggml-cpu-impl.h`), that is,
+`silu(x) = x / (1 + ggml_v_expf(-x))` times up. HLSL has no fused multiply-add
+for fp32, so `_mm256_fmadd_ps` is a correctly rounded fma on integers
+(`d3d12_f32_fma_rn`, a 96-bit window in three dwords), the division is the
+integer `div_rn` above, and every other step is a `precise` fp32 operation
+with `-denorm preserve`. The host tests compare the integer fma with
+`std::fmaf` (random operands over the whole range, cancellation, subnormal
+results, special values), and they compare the element emulation (`d3d12_swiglu_emulate`)
+with a real ggml SWIGLU graph on the host, whose ggml-cpu build takes the same
+AVX2 + FMA path; they require identical bits, including the `exp` slow path (`|n| > 126`).
+
+With both knobs, gate, up, SWIGLU and down can share one submission, so a
+model whose bias `ADD`s and `ROPE` are already on the GPU is expected to go from
+4 to 3 submissions per layer (`[qkv]`, `[o]`, `[gate up SWIGLU down]`). The
+`ffn_*` selftest rows check the one-submission FFN; the per-layer count on a
+whole model is not measured yet.
+With SWIGLU but not the GPU quantize the down projection still ends the
+submission, so the count does not change.
+
+Checks: the console selftest runs `swiglu` rows against ggml-cpu's own SWIGLU on
+the same inputs (required: identical bits): an 11008-wide decode row in place,
+first, before anything has allocated the staging buffer (log line
+`swiglu cold_scratch=1`; it binds no staging memory), a 7-column row in place
+and a staged 3-column row. With the GPU quantize on, three `ffn_*` rows run
+the whole FFN (Q4_0, Q4_K, Q6_K) with and without the GPU quantize: same bits,
+one submission against two. `bench-d3d12-selftest.sh --require-swiglu` requires
+the `swiglu` rows and the cold marker, and with `--require-gpu-quant` the
+`ffn_*` rows too. `paired-bench-summary.py --profile swiglu` takes A =
+`d3d12-gpu-quant.txt` on, B = that and `d3d12-swiglu.txt` on, applies the bias
+ADD margins, accepts Qwen2.5-Coder-1.5B/3B and LFM2.5-1.2B (SWIGLU FFN, no
+biases) and requires fewer decode and no more prefill submissions in B in every
+pair. Not measured on Series S. The DXIL blobs for both knobs were generated
+with dxc 1.9.2609 (`scripts/compile-gpugemv-shader.sh quantize_q8_0
+quantize_q8_k swiglu_f32`).
+
 ### Remaining cuts and the order to remove them (proposal)
 
 A split ends at every node the backend refuses (`ggml-backend.cpp`). The node
@@ -1177,7 +1287,9 @@ Order of work, cheapest first:
    these and `ROPE` the only CPU stretch in a layer is attention, so a layer is one split: `[o … down, next qkv]`, 1 per layer.
    This is the D2-fused direction named under "#310 re-attribution", a new
    decision with its own gate, and it needs a GPU q8 quantize (the CPU
-   quantize costs time per submission, see `quant_ms`).
+   quantize costs time per submission, see `quant_ms`). The quantize and
+   `SWIGLU` are in as opt-ins (sections above), bit-identical to ggml-cpu;
+   `RMS_NORM`+`MUL` and the residual `ADD` are next.
 3. **Attention and KV cache on the GPU.** The only way below 1 per layer. It conflicts
    with the RAM budget (`offload_kqv=false` is why FA AUTO needed the fix
    above) and is not proposed here.

@@ -10,11 +10,20 @@
 # --require-rope requires exactly the ten rope_* rows, in the order the selftest
 # emits them (d3d12-rope.txt = 1), the first of them run with a cold scratch buffer (log line "rope cold_scratch=1"); they are
 # correctness rows, so the decode bandwidth floor does not apply to them.
+# --require-gpu-quant requires the six quant_* rows (d3d12-gpu-quant.txt = 1):
+# a two-matmul chain bit-identical with and without the GPU quantize, in one
+# submission with it and two without.
+# --require-swiglu requires the three swiglu* rows (d3d12-swiglu.txt = 1), bit
+# identical to ggml-cpu, the first run with a cold scratch buffer (log line
+# "swiglu cold_scratch=1"); with --require-gpu-quant too, also the three ffn_*
+# rows (gate, up, SWIGLU and down in one submission, same bits as two).
+# quant_*, swiglu* and ffn_* are correctness rows: no bandwidth floor.
 #
 # Prerequisites: CI MSVC package (unified or llamacpp) installed on Series S.
 # Usage:
 #   source ~/.config/xllama/xbox-env
 #   ./scripts/bench-d3d12-selftest.sh [--out PATH] [--force] [--require-bias-add] [--require-rope]
+#     [--require-gpu-quant] [--require-swiglu]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -27,6 +36,8 @@ TIMEOUT_S=600
 FORCE=0
 REQUIRE_BIAS_ADD=0
 REQUIRE_ROPE=0
+REQUIRE_GPU_QUANT=0
+REQUIRE_SWIGLU=0
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--out)
@@ -45,8 +56,16 @@ while [[ $# -gt 0 ]]; do
 		REQUIRE_ROPE=1
 		shift
 		;;
+	--require-gpu-quant)
+		REQUIRE_GPU_QUANT=1
+		shift
+		;;
+	--require-swiglu)
+		REQUIRE_SWIGLU=1
+		shift
+		;;
 	-h | --help)
-		sed -n '2,17p' "$0"
+		sed -n '2,27p' "$0"
 		exit 0
 		;;
 	*)
@@ -74,7 +93,7 @@ trap 'rm -rf "$TMP"' EXIT
 "${SCRIPT_DIR}/deploy.sh" upload-file "$TMP/d3d12be.flag" "$PFN" "" "d3d12be.flag"
 "${SCRIPT_DIR}/deploy.sh" stop-app || true
 log_lines=0
-if ((REQUIRE_BIAS_ADD || REQUIRE_ROPE)); then
+if ((REQUIRE_BIAS_ADD || REQUIRE_ROPE || REQUIRE_SWIGLU)); then
 	"${SCRIPT_DIR}/deploy.sh" get-log "$PFN" >"$TMP/before.log"
 	log_lines=$(wc -l <"$TMP/before.log")
 fi
@@ -115,13 +134,22 @@ if ((REQUIRE_ROPE)); then
 	fi
 fi
 
-python3 - "$OUT" "$REQUIRE_BIAS_ADD" "$REQUIRE_ROPE" <<'PY'
+if ((REQUIRE_SWIGLU)); then
+	"${SCRIPT_DIR}/deploy.sh" get-log "$PFN" | tail -n "+$((log_lines + 1))" >"$TMP/after-swiglu.log"
+	if ! grep -aF '[xllama] d3d12be: swiglu cold_scratch=1' "$TMP/after-swiglu.log" >/dev/null; then
+		echo "GATE=FAIL (first cold SWIGLU marker missing from this run)" >&2
+		exit 1
+	fi
+fi
+
+python3 - "$OUT" "$REQUIRE_BIAS_ADD" "$REQUIRE_ROPE" "$REQUIRE_GPU_QUANT" "$REQUIRE_SWIGLU" <<'PY'
 import csv, math, sys
 rows = list(csv.DictReader(open(sys.argv[1])))
 bad = [r for r in rows if r["ok"] != "1" or r["d3d12_ran"] != "1" or
        any(not math.isfinite(float(r[k])) or float(r[k]) < 0
            for k in ("rel_err", "gpu_ms", "packed_gbs"))]
-slow = [r for r in rows if r["ncols"] == "1" and not r["type"].startswith("rope_") and
+correctness = ("rope_", "quant_", "swiglu", "ffn_")
+slow = [r for r in rows if r["ncols"] == "1" and not r["type"].startswith(correctness) and
         float(r["packed_gbs"]) < 100.0]
 print(f"--- selftest gate: {len(rows) - len(bad)}/{len(rows)} cases correct; "
       f"{len(slow)} decode case(s) under 100 GB/s ---")
@@ -143,8 +171,28 @@ rope_got = [(r["type"], r["ncols"]) for r in rope_rows]
 rope_ok = rope_got == rope_expected
 if require_rope and not rope_ok:
     print(f"FAIL expected the ten rope_* rows {rope_expected}; found {rope_got}")
+require_gpu_quant = sys.argv[4:5] == ["1"]
+require_swiglu = sys.argv[5:6] == ["1"]
+def kind(prefix):
+    return [(r["type"], r["ncols"]) for r in rows if r["type"].startswith(prefix)]
+quant_expected = [("quant_q8_0", "1"), ("quant_q8_K", "1"), ("quant_q8_0", "7"),
+                  ("quant_q8_K", "7"), ("quant_q8_0", "1"), ("quant_q8_K", "1")]
+quant_ok = kind("quant_") == quant_expected
+if require_gpu_quant and not quant_ok:
+    print(f"FAIL expected the six quant_* rows {quant_expected}; found {kind('quant_')}")
+# The in-place decode row runs first (cold scratch), the rest after the matmuls.
+swiglu_expected = [("swiglu", "1"), ("swiglu", "7"), ("swiglu_staged", "3")]
+swiglu_ok = kind("swiglu") == swiglu_expected
+if require_swiglu and not swiglu_ok:
+    print(f"FAIL expected the three swiglu rows {swiglu_expected}; found {kind('swiglu')}")
+ffn_expected = [("ffn_q4_0", "1"), ("ffn_q4_K", "1"), ("ffn_q6_K", "7")]
+ffn_ok = kind("ffn_") == ffn_expected
+if require_swiglu and require_gpu_quant and not ffn_ok:
+    print(f"FAIL expected the three ffn_* rows {ffn_expected}; found {kind('ffn_')}")
 passed = (bool(rows) and not bad and not slow and (not require_bias_add or bias_add_first) and
-          (not require_rope or rope_ok))
+          (not require_rope or rope_ok) and (not require_gpu_quant or quant_ok) and
+          (not require_swiglu or swiglu_ok) and
+          (not (require_swiglu and require_gpu_quant) or ffn_ok))
 print("GATE=" + ("PASS" if passed else "FAIL"))
 sys.exit(0 if passed else 1)
 PY

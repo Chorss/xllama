@@ -1108,4 +1108,10 @@ TEST_CASE("ggml_d3d12: SWIGLU rules") {
     bad = d;
     bad.ne2 = 2;
     CHECK_FALSE(d3d12_swiglu_supported(bad));
+    bad = d;
+    bad.src_in_weight_buffer = true; // D3D12_Weights has no UAV flag
+    CHECK_FALSE(d3d12_swiglu_supported(bad));
+    bad = d;
+    bad.src_in_non_host_buffer = true; // graph_compute reads it in place or memcpy's it
+    CHECK_FALSE(d3d12_swiglu_supported(bad));
 }

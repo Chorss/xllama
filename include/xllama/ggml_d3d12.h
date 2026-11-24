@@ -123,6 +123,11 @@ struct D3d12SwigluDesc {
     bool glu_op_swiglu = false;                      // op_params[0] == GGML_GLU_OP_SWIGLU
     bool rows_contiguous = false;                    // nb0 == 4 for src0, src1 and dst
     bool same_shapes = false;                        // src0, src1 and dst
+    // Gate or up already in a buffer the kernel cannot bind as a UAV: weights
+    // (D3D12_Weights) or a non-host buffer. Unallocated activations are the
+    // scheduler's and land in D3D12_Host.
+    bool src_in_weight_buffer = false;
+    bool src_in_non_host_buffer = false;
 };
 bool d3d12_swiglu_supported(const D3d12SwigluDesc& d);
 inline constexpr int kD3d12SwigluThreads = 256;
