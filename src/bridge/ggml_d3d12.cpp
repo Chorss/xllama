@@ -3667,13 +3667,27 @@ D3d12SelftestRow run_fma_probe_case(int variant) {
     std::uniform_real_distribution<float> mag(0.7f, 1.4f);
     for (int i = 0; i < n * 3; ++i)
         in[i] = rng() & 1u ? mag(rng) : -mag(rng);
-    // A few chains start on a tie only the exact sum resolves:
-    // (1 + 2^-12)^2 = 1 + 2^-11 + 2^-24, c = ±2^-70.
+    // Chains that start on the hard cases: a tie only the exact sum resolves,
+    // (1 + 2^-12)^2 = 1 + 2^-11 + 2^-24 with c = ±2^-70; subnormal results;
+    // the overflow tie a * b = 2^128 - 2^103 with c = ±2^-20; NaN and inf.
     for (int i = 0; i < 64; ++i) {
-        in[i * 3] = 1.0f + 0x1p-12f;
-        in[i * 3 + 1] = (i & 1 ? -1.0f : 1.0f) * (1.0f + 0x1p-12f);
-        in[i * 3 + 2] = (i & 2 ? -1.0f : 1.0f) * 0x1p-70f;
+        const float sgn = i & 1 ? -1.0f : 1.0f, sc = i & 2 ? -1.0f : 1.0f;
+        float* t = in + i * 3;
+        t[0] = 1.0f + 0x1p-12f;
+        t[1] = sgn * (1.0f + 0x1p-12f);
+        t[2] = sc * 0x1p-70f;
+        t = in + (64 + i) * 3; // products near 2^-146: subnormal fp32 results
+        t[0] = (1.0f + static_cast<float>(i) * 0x1p-7f) * 0x1p-75f;
+        t[1] = sgn * 1.25f * 0x1p-71f;
+        t[2] = sc * static_cast<float>(i) * 0x1p-149f;
+        t = in + (128 + i) * 3;
+        t[0] = sgn * std::ldexp(18631.0f, 60);
+        t[1] = std::ldexp(1801.0f, 43);
+        t[2] = sc * 0x1p-20f;
     }
+    in[192 * 3] = std::numeric_limits<float>::quiet_NaN();
+    in[193 * 3 + 1] = std::numeric_limits<float>::infinity();
+    in[194 * 3 + 2] = -std::numeric_limits<float>::infinity();
     std::vector<std::uint32_t> ref(n);
     for (int i = 0; i < n; ++i) {
         float a = in[i * 3], b = in[i * 3 + 1], v = in[i * 3 + 2];
