@@ -15,9 +15,9 @@
 #     -denorm preserve; -D Q8_K=1 for the q8_K blob)
 #   shaders/ggml_d3d12_swiglu_f32.hlsl → ggml_d3d12_swiglu_f32_dxil.h (cs_6_4, -denorm preserve)
 #   shaders/ggml_d3d12_rmsnorm_probe.hlsl → ggml_d3d12_rmsnorm_probe_dxil.h (cs_6_4,
-#     -denorm preserve; selftest cost probe, needs shader doubles)
+#     -denorm preserve; selftest cost probe, needs shader doubles; _u16 with -D UNROLL=1)
 #
-# Usage: compile-gpugemv-shader.sh [naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q6_k|get_rows_q6_k|add_bias_f32|rope_f32|quantize_q8_0|quantize_q8_k|swiglu_f32|rmsnorm_probe ...]
+# Usage: compile-gpugemv-shader.sh [naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q6_k|get_rows_q6_k|add_bias_f32|rope_f32|quantize_q8_0|quantize_q8_k|swiglu_f32|rmsnorm_probe|rmsnorm_probe_u16 ...]
 #        (default: all)
 # A different dxc release emits different bytes: regenerate only the targets
 # you changed so measured blobs stay the ones the CSVs were recorded with.
@@ -134,8 +134,12 @@ compile_target() {
 		"$ROOT/shaders/generated/ggml_d3d12_rmsnorm_probe_dxil.h" \
 		"shaders/ggml_d3d12_rmsnorm_probe.hlsl -denorm preserve" "kGgmlD3d12RmsnormProbeDxil" \
 		cs_6_4 -denorm preserve ;;
+	rmsnorm_probe_u16) compile_one "$ROOT/shaders/ggml_d3d12_rmsnorm_probe.hlsl" \
+		"$ROOT/shaders/generated/ggml_d3d12_rmsnorm_probe_u16_dxil.h" \
+		"shaders/ggml_d3d12_rmsnorm_probe.hlsl -D UNROLL=1 -denorm preserve" "kGgmlD3d12RmsnormProbeU16Dxil" \
+		cs_6_4 -D UNROLL=1 -denorm preserve ;;
 	*)
-		echo "unknown target: $1 (naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q6_k|get_rows_q6_k|add_bias_f32|rope_f32|quantize_q8_0|quantize_q8_k|swiglu_f32|rmsnorm_probe)" >&2
+		echo "unknown target: $1 (naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q6_k|get_rows_q6_k|add_bias_f32|rope_f32|quantize_q8_0|quantize_q8_k|swiglu_f32|rmsnorm_probe|rmsnorm_probe_u16)" >&2
 		exit 2
 		;;
 	esac
@@ -143,7 +147,7 @@ compile_target() {
 
 if [[ $# -eq 0 ]]; then
 	set -- naive wave32 rows dot4 mmv_q4_0 mmv_q4_k mmv_q6_k get_rows_q6_k add_bias_f32 rope_f32 \
-		quantize_q8_0 quantize_q8_k swiglu_f32 rmsnorm_probe
+		quantize_q8_0 quantize_q8_k swiglu_f32 rmsnorm_probe rmsnorm_probe_u16
 fi
 for target in "$@"; do
 	compile_target "$target"

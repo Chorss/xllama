@@ -1131,6 +1131,7 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         #include "ggml_d3d12_quantize_q8_0_dxil.h"
         #include "ggml_d3d12_quantize_q8_k_dxil.h"
         #include "ggml_d3d12_rmsnorm_probe_dxil.h"
+        #include "ggml_d3d12_rmsnorm_probe_u16_dxil.h"
         #include "ggml_d3d12_rope_f32_dxil.h"
         #include "ggml_d3d12_swiglu_f32_dxil.h"
         #include "xllama/d3d12_dyn.h"
@@ -1183,6 +1184,7 @@ struct Gpu {
     // d3d12-rmsnorm-probe.txt = 1: selftest-only cost probe of a bit-exact
     // RMS_NORM's serial double sum; no graph op uses it.
     ComPtr<ID3D12PipelineState> pso_rmsnorm_probe;
+    ComPtr<ID3D12PipelineState> pso_rmsnorm_probe_u16; // loads batched ahead of the adds
     bool rmsnorm_probe = false;
     ComPtr<ID3D12QueryHeap> ts;
     ComPtr<ID3D12Resource> ts_rb;
@@ -1441,14 +1443,19 @@ bool init_gpu(Gpu& g) {
             g.rmsnorm_probe = false;
     }
     if (g.rmsnorm_probe) {
-        D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
-        pd.pRootSignature = g.root.Get();
-        pd.CS.pShaderBytecode = kGgmlD3d12RmsnormProbeDxil;
-        pd.CS.BytecodeLength = kGgmlD3d12RmsnormProbeDxilSize;
-        hr = g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_rmsnorm_probe));
-        if (FAILED(hr))
-            log_output("[xllama] d3d12: RMS_NORM probe unavailable: " +
-                       d3d12c::hr_message("CreateComputePipelineState", hr) + "\n");
+        const void* blobs[2] = {kGgmlD3d12RmsnormProbeDxil, kGgmlD3d12RmsnormProbeU16Dxil};
+        const size_t sizes[2] = {kGgmlD3d12RmsnormProbeDxilSize, kGgmlD3d12RmsnormProbeU16DxilSize};
+        ComPtr<ID3D12PipelineState>* psos[2] = {&g.pso_rmsnorm_probe, &g.pso_rmsnorm_probe_u16};
+        for (int i = 0; i < 2; ++i) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+            pd.pRootSignature = g.root.Get();
+            pd.CS.pShaderBytecode = blobs[i];
+            pd.CS.BytecodeLength = sizes[i];
+            hr = g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&*psos[i]));
+            if (FAILED(hr))
+                log_output("[xllama] d3d12: RMS_NORM probe unavailable: " +
+                           d3d12c::hr_message("CreateComputePipelineState", hr) + "\n");
+        }
     }
     if (g.rmsnorm_probe)
         log_output(std::string("[xllama] d3d12: rmsnorm_probe=") +
@@ -3521,9 +3528,9 @@ constexpr int kD3d12RmsnormProbeMaxN = 4096; // MAX_N in ggml_d3d12_rmsnorm_prob
 // d3d12-rmsnorm-probe.txt: GPU time of the serial double sum a bit-exact
 // RMS_NORM needs for one row of n floats (median of 5 dispatches), and whether
 // the GPU's double equals the host's sum of the same products in the same order.
-D3d12SelftestRow run_rmsnorm_probe_case(int n) {
+D3d12SelftestRow run_rmsnorm_probe_case(int n, bool unrolled) {
     D3d12SelftestRow row;
-    row.type = "rmsnorm_probe";
+    row.type = unrolled ? "rmsnorm_probe_u16" : "rmsnorm_probe";
     row.n = n;
     row.ncols = 1;
     Gpu& g = gpu();
@@ -3531,7 +3538,8 @@ D3d12SelftestRow run_rmsnorm_probe_case(int n) {
         row.error = "width outside the probe's groupshared row";
         return row;
     }
-    if (!g.pso_rmsnorm_probe) {
+    ID3D12PipelineState* pso = unrolled ? g.pso_rmsnorm_probe_u16.Get() : g.pso_rmsnorm_probe.Get();
+    if (!pso) {
         row.error = "no RMS_NORM probe pipeline (shader_doubles=0 or PSO failed)";
         return row;
     }
@@ -3568,7 +3576,7 @@ D3d12SelftestRow run_rmsnorm_probe_case(int n) {
         std::lock_guard<std::mutex> lock(g.mu);
         const bool ran = run_now(g, [&](ID3D12GraphicsCommandList* cl) {
             cl->SetComputeRootSignature(g.root.Get());
-            cl->SetPipelineState(g.pso_rmsnorm_probe.Get());
+            cl->SetPipelineState(pso);
             cl->SetComputeRoot32BitConstants(0, 8, c, 0);
             cl->SetComputeRootUnorderedAccessView(2, va);
             cl->SetComputeRootUnorderedAccessView(3, va + kOut);
@@ -3874,8 +3882,9 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
     // RMS_NORM cost probe (d3d12-rmsnorm-probe.txt): model widths from
     // Coder-1.5B (1536) and Coder-3B (2048) up to 4096.
     if (gpu().rmsnorm_probe)
-        for (const int n : {1536, 2048, 3072, 4096})
-            out->push_back(run_rmsnorm_probe_case(n));
+        for (const bool unrolled : {false, true})
+            for (const int n : {1536, 2048, 3072, 4096})
+                out->push_back(run_rmsnorm_probe_case(n, unrolled));
     ggml_backend_free(backend);
 }
 

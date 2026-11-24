@@ -6,6 +6,7 @@
 // at a model's width: the group loads the row and forms the products (each
 // correctly rounded, `precise`, -denorm preserve), thread 0 sums them in double
 // precision from groupshared memory and stores the double's bits.
+// Built twice: plain loop, and -D UNROLL=1 (loads batched ahead of the adds).
 // Root signature (src/bridge/ggml_d3d12.cpp): b0 constants, u0 the output
 // (two dwords per row), u1 the F32 input.
 
@@ -41,8 +42,23 @@ void CSMain(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
     if (tid != 0u)
         return;
     precise double s = 0.0;
+#ifdef UNROLL
+    // Sixteen independent groupshared loads first, then the sixteen dependent
+    // adds in the same order, so the load latency leaves the critical path.
+    uint j = 0u;
+    for (; j + 16u <= m; j += 16u) {
+        float v[16];
+        [unroll] for (uint l = 0u; l < 16u; ++l)
+            v[l] = sq[j + l];
+        [unroll] for (uint l2 = 0u; l2 < 16u; ++l2)
+            s = s + (double)v[l2];
+    }
+    for (; j < m; ++j)
+        s = s + (double)sq[j];
+#else
     for (uint j = 0u; j < m; ++j)
         s = s + (double)sq[j];
+#endif
     uint lo, hi;
     asuint(s, lo, hi);
     Out.Store2(row * 8u, uint2(lo, hi));

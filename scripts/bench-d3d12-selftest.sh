@@ -150,9 +150,9 @@ import csv, math, sys
 rows = list(csv.DictReader(open(sys.argv[1])))
 # Cost-probe rows answer a question; they are printed, not gated.
 for r in rows:
-    if r["type"] == "rmsnorm_probe":
-        print(f"PROBE rmsnorm_probe n={r['n']} gpu_ms={r['gpu_ms']} ok={r['ok']} {r['error']}")
-rows = [r for r in rows if r["type"] != "rmsnorm_probe"]
+    if r["type"].startswith("rmsnorm_probe"):
+        print(f"PROBE {r['type']} n={r['n']} gpu_ms={r['gpu_ms']} ok={r['ok']} {r['error']}")
+rows = [r for r in rows if not r["type"].startswith("rmsnorm_probe")]
 bad = [r for r in rows if r["ok"] != "1" or r["d3d12_ran"] != "1" or
        any(not math.isfinite(float(r[k])) or float(r[k]) < 0
            for k in ("rel_err", "gpu_ms", "packed_gbs"))]
